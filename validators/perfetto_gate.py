@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """perfetto_gate.py — GATE 2: Perfetto TracePacket stream -> native VIREL, round-trip against a golden model.
 
-No protoc; generic protobuf wire decode. Field numbers verified against perfetto sources 2026-10-03:
+No protoc; generic protobuf wire decode. Field numbers verified against perfetto sources 2026-10-03
+(framing and clocks re-checked 2026-10-04, ev-perfetto-split-clock):
+  Trace:       packet=1 -- a file is the bytes of one Trace message, so every packet is
+               framed as 0x0A + varint length + TracePacket (other top-level fields are skipped)
   TracePacket: timestamp=8 trusted_packet_sequence_id=10 track_event=11 interned_data=12
-               sequence_flags=13 (SEQ_CLEARED=1/NEEDS=2) previous_packet_dropped=42 clock_snapshot=6
+               sequence_flags=13 (bit SEQ_CLEARED=1 / bit NEEDS=2; 3 = both) previous_packet_dropped=42
+               clock_snapshot=6 timestamp_clock_id=58 trace_packet_defaults=59
+  ClockSnapshot: clocks=1 primary_trace_clock=2; Clock: clock_id=1 timestamp=2 is_incremental=3
+               builtin clocks: REALTIME=1 BOOTTIME=6 (default packet clock)
   TrackEvent:  type=9 (SLICE_BEGIN=1 SLICE_END=2 INSTANT=3 COUNTER=4) track_uuid=11
                name_iid=10 name=23 categories=22 counter_value=30 double_counter_value=44
   InternedData:event_categories=1 event_names=2; entry {iid=1, name=2}
-  TrackDescriptor: uuid=1 name=2
+  TrackDescriptor: uuid=1 name=2 counter=8 (counter events need a counter track)
 
 Mapping (per coverage matrix / otlp finding):
   trusted_packet_sequence_id -> VIREL writer id (ONE WRITER PER CHUNK; one chunk per sequence)
@@ -18,6 +24,10 @@ Mapping (per coverage matrix / otlp finding):
   INSTANT / COUNTER          -> instant / counter event types
   previous_packet_dropped    -> virel.loss sync event; SEQ_INCREMENTAL_STATE_CLEARED -> virel.clear
   packet timestamp (BOOTTIME ns) -> chunk-relative ticks; ticksPerSecond = 1e9 (tick == ns)
+  chunk startNanos (UTC ns)  -> REALTIME of the first event, via the latest ClockSnapshot whose
+                                BOOTTIME is at or before it (REALTIME - BOOTTIME offset)
+Not handled (the gate fails loudly instead of misreading): packets on a clock other than BOOTTIME
+(timestamp_clock_id / trace_packet_defaults, incl. SDK incremental clocks), compressed packets.
 """
 import struct, sys
 from collections import defaultdict
@@ -59,16 +69,33 @@ def fields(d):
     return out
 
 TP_TS, TP_SEQ, TP_TE, TP_INT, TP_FLAGS, TP_DROP, TP_DESC = 8, 10, 11, 12, 13, 42, 60
+TP_CLOCK, TP_CLOCK_ID, TP_DEFAULTS = 6, 58, 59
+TRACE_PACKET = 1                        # Trace.packet
+CS_CLOCKS, CS_PRIMARY, CK_ID, CK_TS, CK_INCR = 1, 2, 1, 2, 3
+CLK_REALTIME, CLK_BOOTTIME = 1, 6
 TE_TYPE, TE_NAME_IID, TE_TRACK, TE_NAME, TE_CATS, TE_COUNTER = 9, 10, 11, 23, 22, 30
 ID_CATS, ID_NAMES, EI_IID, EI_NAME = 1, 2, 1, 2
 SEQ_NEEDS, SEQ_CLEARED = 2, 1
 
 # ---------------- stage 1: synthetic perfetto stream + golden model ----------------
-T0 = 1_700_000_000_000_000_000
+# Packet timestamps are BOOTTIME (ns since boot), not UNIX time. The service sequence (id 1)
+# carries a ClockSnapshot that relates BOOTTIME to REALTIME, as traced does at session start.
+T0 = 3_600_000_000_000                       # BOOTTIME: one hour after boot
+REAL_AT_T0 = 1_759_600_000_000_000_000       # REALTIME (UNIX ns) at BOOTTIME == T0 - 1000
+SERVICE_SEQ = 1
+
+def is_cleared(flags):
+    return flags is not None and (flags & SEQ_CLEARED) != 0
 
 def synth():
     buf = bytearray(); golden = {}
-    def packet(p_: bytes): buf.extend(le_varint(len(p_)) + p_)
+    def packet(p_: bytes): buf.extend(wl(TRACE_PACKET) + le_varint(len(p_)) + p_)
+    def clock(cid, ts):
+        c = wf(CK_ID) + le_varint(cid) + wf(CK_TS) + le_varint(ts)
+        return wl(CS_CLOCKS) + le_varint(len(c)) + c
+    snap = clock(CLK_BOOTTIME, T0 - 1000) + clock(CLK_REALTIME, REAL_AT_T0) + wf(CS_PRIMARY) + le_varint(CLK_BOOTTIME)
+    packet(wf(TP_TS) + le_varint(T0 - 1000) + wf(TP_SEQ) + le_varint(SERVICE_SEQ) +
+           wf(TP_CLOCK_ID) + le_varint(CLK_BOOTTIME) + wl(TP_CLOCK) + le_varint(len(snap)) + snap)
     iids = {}
     def interned(seq, table, name):
         k = iids.setdefault((seq, table), {})
@@ -89,12 +116,17 @@ def synth():
         packet(wf(TP_SEQ) + le_varint(seq) + wl(TP_INT) + le_varint(len(payload)) + payload)
         pend[(seq, ID_NAMES)].clear(); pend[(seq, ID_CATS)].clear()
     for seq in (7, 11):
-        g = golden[seq] = {"slices": [], "instants": [], "counters": [], "loss": 0, "clear": 0}
-        # track descriptor
+        g = golden[seq] = {"slices": [], "instants": [], "counters": [], "loss": 0, "clear": 1,
+                           "start_unix": REAL_AT_T0 + (T0 + seq * 10) - (T0 - 1000)}
+        # track descriptor; the first packet of a sequence clears incremental state (SDK behaviour)
         name = f"track-{seq}"
-        packet(wf(TP_SEQ) + le_varint(seq) +
+        packet(wf(TP_SEQ) + le_varint(seq) + wf(TP_FLAGS) + le_varint(SEQ_CLEARED) +
                wl(TP_DESC) + le_varint(len(wf(1) + le_varint(101 + seq) + wl(2) + le_varint(len(name)) + name.encode())) +
                wf(1) + le_varint(101 + seq) + wl(2) + le_varint(len(name)) + name.encode())
+        # counter events must target a track whose descriptor declares `counter` (field 8)
+        cname = f"counter-{seq}"
+        cdesc = wf(1) + le_varint(201 + seq) + wl(2) + le_varint(len(cname)) + cname.encode() + wl(8) + le_varint(0)
+        packet(wf(TP_SEQ) + le_varint(seq) + wl(TP_DESC) + le_varint(len(cdesc)) + cdesc)
         w = interned(seq, ID_NAMES, "work"); io = interned(seq, ID_NAMES, "io")
         cat = interned(seq, ID_CATS, "io-cat")
         flush_interned(seq)
@@ -110,14 +142,15 @@ def synth():
             te(seq=seq, ts=ts + 1, body=wf(TE_TYPE) + le_varint(3) + wf(TE_TRACK) + le_varint(101 + seq) +
                                    wf(TE_NAME_IID) + le_varint(io))
             g["instants"].append((ts + 1, "io"))
-            te(seq=seq, ts=ts + 2, body=wf(TE_TYPE) + le_varint(4) + wf(TE_TRACK) + le_varint(101 + seq) +
+            te(seq=seq, ts=ts + 2, body=wf(TE_TYPE) + le_varint(4) + wf(TE_TRACK) + le_varint(201 + seq) +
                                    wf(TE_COUNTER) + le_varint(42 + i))
             g["counters"].append(42 + i)
             te(seq=seq, ts=ts + 3, body=wf(TE_TYPE) + le_varint(2) + wf(TE_TRACK) + le_varint(101 + seq))
             g["slices"][i][1] = ts + 3
         packet(wf(TP_SEQ) + le_varint(seq) + wf(TP_DROP) + bytes([1]) + wf(TP_FLAGS) + le_varint(SEQ_NEEDS))
         g["loss"] += 1
-        packet(wf(TP_SEQ) + le_varint(seq) + wf(TP_FLAGS) + le_varint(SEQ_CLEARED))
+        # a reset packet commonly carries CLEARED|NEEDS (3): must count as a clear (bit test)
+        packet(wf(TP_SEQ) + le_varint(seq) + wf(TP_FLAGS) + le_varint(SEQ_CLEARED | SEQ_NEEDS))
         g["clear"] += 1
     return bytes(buf), golden
 
@@ -194,7 +227,29 @@ def metadata_event():
     # native meta preamble = [ts][dur][metadataId] then envelope [tag][payload] (no inner length)
     return event(0, le_varint(0) + le_varint(0) + le_varint(1) + bytes([0]) + payload)
 
-def to_tcf(packets_by_seq, golden):
+def clock_offsets(packets):
+    """ClockSnapshot packets -> sorted [(boottime, realtime - boottime)]"""
+    offs = []
+    for pkt in packets:
+        f = fields(pkt)
+        for cs in f.get(TP_CLOCK, []):
+            clocks = {}
+            for c in fields(cs).get(CS_CLOCKS, []):
+                cf = fields(c)
+                if cf.get(CK_INCR, [0])[0]:
+                    continue
+                clocks[cf[CK_ID][0]] = cf[CK_TS][0]
+            if CLK_BOOTTIME in clocks and CLK_REALTIME in clocks:
+                offs.append((clocks[CLK_BOOTTIME], clocks[CLK_REALTIME] - clocks[CLK_BOOTTIME]))
+    return sorted(offs)
+
+def boot_to_unix(offs, ts):
+    prior = [o for (b, o) in offs if b <= ts]
+    if not prior:
+        raise ValueError(f"no BOOTTIME/REALTIME ClockSnapshot at or before {ts}")
+    return ts + prior[-1]
+
+def to_tcf(packets_by_seq, golden, offs):
     """per sequence -> one native chunk; returns container bytes"""
     out = bytearray()
     writer_prefix = 0xC0FFEE0000000000
@@ -219,9 +274,11 @@ def to_tcf(packets_by_seq, golden):
                         pool_key = pk(nm)
                         # NOTE: use iid -> key mapping identical for both tables
                         evs_map.setdefault((seq, tno, iid), pool_key)
+            if TP_DEFAULTS in f or f.get(TP_CLOCK_ID, [CLK_BOOTTIME])[0] != CLK_BOOTTIME:
+                raise ValueError(f"seq {seq}: packet clock other than BOOTTIME is not supported")
             for dropped in f.get(TP_DROP, []):
                 body_events.append((6, le_varint(W64 & (writer_prefix + seq)) + le_varint(1)))
-            if f.get(TP_FLAGS, [None])[-1] == SEQ_CLEARED:
+            if is_cleared(f.get(TP_FLAGS, [None])[-1]):
                 body_events.append((7, le_varint(W64 & (writer_prefix + seq))))
             if TP_TE not in f: continue
             ts = f[TP_TS][0]
@@ -246,7 +303,7 @@ def to_tcf(packets_by_seq, golden):
         meta = metadata_event()
         cp = tcf_string_pool_event(pool)
         chunk_start = len(out)
-        hdr = ev_header(base if base else E_BASE)               # startNanos = absolute packet clock
+        hdr = ev_header(boot_to_unix(offs, base) if base is not None else E_BASE)   # startNanos = REALTIME
         hdr[68:76] = struct.pack(">Q", writer_prefix + seq)     # writer id
         last_tick = max((0,) + tuple(rd_varint(b_, 0)[0] for (t_, b_) in body_events if t_ in (2, 3, 4, 5)))
         struct.pack_into(">Q", hdr, 40, last_tick + 1)          # chunk duration (ns == ticks here)
@@ -264,10 +321,22 @@ def to_tcf(packets_by_seq, golden):
 evs_map = {}
 # ---------------- stage 3: verify vs golden ----------------
 def stream_packets(data):
+    """top level of a Trace message: yield each `packet` (field 1), skip any other field"""
     p = 0
     while p < len(data):
-        n, p = rd_varint(data, p)
-        yield data[p:p + n]; p += n
+        key, p = rd_varint(data, p)
+        fno, wt = key >> 3, key & 7
+        if wt == 2:
+            n, p = rd_varint(data, p)
+            if fno == TRACE_PACKET and n:
+                yield data[p:p + n]
+            p += n
+        elif wt == 0: _, p = rd_varint(data, p)
+        elif wt == 1: p += 8
+        elif wt == 5: p += 4
+        else: raise IOError(f"top-level wire type {wt}")
+        if p > len(data):
+            raise IOError("truncated trace: packet runs past end of data")
 
 def grouped(data):
     g = defaultdict(list)
@@ -281,10 +350,14 @@ def main():
     data, golden = synth()
     t0 = time.time()
     pkt_groups = {}
-    for pkt in stream_packets(data):
+    packets = list(stream_packets(data))
+    for pkt in packets:
         f = fields(pkt)
-        pkt_groups.setdefault(f.get(TP_SEQ, [None])[0], []).append(pkt)
-    container = to_tcf(pkt_groups, golden)
+        seq = f.get(TP_SEQ, [None])[0]
+        if seq == SERVICE_SEQ:
+            continue                   # service packets: clock snapshots only, no chunk
+        pkt_groups.setdefault(seq, []).append(pkt)
+    container = to_tcf(pkt_groups, golden, clock_offsets(packets))
     open("/tmp/tcf-native-from-perfetto.tcf", "wb").write(container)
     print(f"perfetto stream {len(data)} B -> VIREL {len(container)} B ({time.time()-t0:.3f}s)")
 
@@ -330,10 +403,11 @@ def main():
         c4 = [c[3].get("value") for c in cntrs] == g["counters"]
         c5 = len(loss) == g["loss"] and len(clear) == g["clear"]
         c6 = all(b[3].get("track") == 101 + seq for b in begins)
-        checks.append((seq, c1, c2, c3, c4, c5, c6))
-        ok &= c1 and c2 and c3 and c4 and c5 and c6
-    for (seq, a, b, c, d_, e, f_) in checks:
-        print(f"  seq {seq}: slices {a} durations {b} instants {c} counters {d_} loss/clear {e} tracks {f_}")
+        c7 = struct.unpack_from(">Q", chunk_bytes, 32)[0] == g["start_unix"]
+        checks.append((seq, c1, c2, c3, c4, c5, c6, c7))
+        ok &= c1 and c2 and c3 and c4 and c5 and c6 and c7
+    for (seq, a, b, c, d_, e, f_, h) in checks:
+        print(f"  seq {seq}: slices {a} durations {b} instants {c} counters {d_} loss/clear {e} tracks {f_} wallclock {h}")
     print("GATE 2:", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
