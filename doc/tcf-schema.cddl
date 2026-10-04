@@ -1,0 +1,39 @@
+; VIREL — CDDL contract for CBOR-encoded metadata (encoding id 3, spec §5.2)
+; Scope: the METADATA PAYLOAD carried by the typeId 0 event when the
+; envelope tag = 3. The element/attribute grammar mirrors the XML-v2 model
+; (string pool + element tree) so all encodings express the same model.
+; Conveniences, never substitutes (spec §11). Cross-check: validators/
+; (= the reference converters) + model-lint (doc/tcf-model.avsc).
+
+tcf-metadata = {
+  "string-pool": [* tcf-string],        ; pool refs are POOL INDICES (bare varints in-wire;
+                                        ; CBOR: array indices)
+  "root": tcf-element
+}
+
+tcf-string = null / t / cbytes          ; tag meanings mirror the string-table grammar (§4.1):
+                                        ; 0 null, 2 pool-ref, 3 utf8, 4 char-array, 5 latin-1
+tcf-element = {
+  "name": uint,                         ; index into string-pool
+  "attrs": [* tcf-attr],
+  "children": [* tcf-element]
+}
+
+tcf-attr = {
+  "name": uint,                         ; index into string-pool
+  "value": tcf-attr-value
+}
+
+; ATTRIBUTE VALUES carry the metadata vocabulary of spec §5:
+; classes: name/id/superType/constantPool/dimension; fields: name/class/
+; constantPool/dimension. Values referencing pool strings use indices.
+tcf-attr-value = uint                   ; index into string-pool (all metadata
+                                        ; attribute values are strings in v1.0)
+
+; Normative attribute table (mirrors validators' build_types):
+;   class  <- { "name": N, "id": "N" (decimal string of type id),
+;               "superType"?: N, "constantPool"?: "0" }
+;   field  <- { "name": N, "class": N (decimal string = field's type id),
+;               "constantPool"?: "0", "dimension"?: "1" }
+; Snapshot completeness (§5.1): every class/field the writer's parser
+; contract needs, per chunk. Type ids = container-global, ADD-ONLY (§5.3).

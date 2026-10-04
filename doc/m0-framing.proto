@@ -1,0 +1,71 @@
+// VIREL m0 — canonical proto for the framing/control plane (spec §4, §5)
+// Codegen convenience per spec §11; the binary truth is the annex-verified
+// varint grammar in doc/TraceContainerFormat.md (validators/ = reference).
+// Notes:
+//  - All integers use VIREL Varint128: <= 9 bytes; when the 9th raw byte is
+//    used, all 8 group bytes carry the continuation bit (gate-3/4 norm).
+//  - String-typed pooled fields are TAG-ENCODED (tag 0 null / 2 poolkey /
+//    3 inline utf8 / 4 char-array / 5 latin-1) — NOT expressible as plain
+//    proto; the proto form shows the RESOLVED view (proto3).
+//  - Non-string pooled fields are BARE varint keys, 0 = null (shown as
+//    uint with reserved 0).
+syntax = "proto3";
+package virel.m0;
+
+// typeId 0 — metadata event (§5.2)
+message MetadataEvent {
+  uint64 start_ticks = 1;      // timestamp word
+  uint64 duration_ticks = 2;
+  uint64 metadata_id = 3;      // cross-chunk dedup cache id (reader-side only)
+  EncodingId encoding = 4;     // native only: envelope tag (0 = xml-v2 legacy)
+  bytes payload = 5;           // envelope-encoded metadata (pool + element tree)
+}
+enum EncodingId {
+  XML_V2 = 0;      // annex-binarized XML (legacy-compatible)
+  FLAT = 1; PROTOBUF = 2; CBOR = 3; JSON = 4;   // registry (spec §5.2)
+  AVRO = 5;        // add-only-evolution match (find-idl-codegen)
+}
+
+// typeId 1 — state snapshot (§4.4): pools + state, validity = chunk.
+// JFR annex calls this byte-frozen shape a checkpoint. Native snapshots with
+// snapshotFlags.TYPE_SUMMARY_PRESENT add the cumulative type summary before
+// the pool section on the wire.
+message StateSnapshotEvent {
+  uint64 start_ticks = 1;
+  uint64 duration_ticks = 2;
+  uint64 delta_back = 3;       // walk-to-previous-checkpoint hint
+  uint32 flush = 4;
+  repeated TypeCount type_summary = 5; // native when summary-present; sorted by type_id
+  repeated Pool pools = 6;
+  message TypeCount {
+    uint64 type_id = 1;
+    uint64 emitted_count = 2;  // cumulative in this chunk; excludes ids 0/1
+  }
+  message Pool {
+    uint32 type_id = 1;
+    repeated Entry entries = 2;
+    message Entry {
+      uint64 key = 1;
+      bytes full_payload = 2;  // value in the declared type's field grammar
+    }
+  }
+}
+
+// m0 event vocabulary (§4.4, §5.5) — declared under module m0, local ids 2..9
+message SliceBegin  { uint64 track = 1; string value = 2; string reason = 3; }   // id 2
+message SliceEnd    { uint64 track = 1; string reason = 2; }                      // id 3 (kind enum via track namespace or reason)
+message Instant     { uint64 track = 1; string value = 2; }                       // id 4
+message Counter     { uint64 track = 1; int64 value = 2; }                        // id 5
+message Loss        { uint64 writer_id = 1; uint64 span_events = 2; }             // id 6
+message Clear       { uint64 writer_id = 1; }                                     // id 7
+message Eos         {}                                                            // id 8: ZERO-PAYLOAD (gates 3/5)
+message Provenance  {                                                             // id 9
+  string source_format = 1;
+  string source_format_version = 2;
+  string converter = 3;
+  uint64 fidelity = 4;         // 0 LOSSLESS, 1 LOSSY_DOCUMENTED, ...
+  bytes original_payload_hash = 5;  // 64-bit fnv1a64 (or stronger) of source bytes
+}
+
+// Time words: EVERY event = [size][typeId][startTicks][durationTicks?]
+// (duration present iff the declared type declares one, §4.2).

@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""build_tcf_model_avsc.py — regenerates doc/tcf-model.avsc from python structure (guaranteed valid)."""
+import json, sys
+from pathlib import Path
+
+# ---------------- base definitions (dependency order) ----------------
+nfv_named = {
+    "type": "record", "name": "NamedFieldValue",
+    "fields": [{"name": "name", "type": "string"},
+               {"name": "value", "type": "virel.model.FieldValue"}]}
+FieldValue = {
+    "type": "record", "name": "FieldValue",
+    "doc": "Tagged union of all content-layer values; union order = the content-layer kind register: 0 null, 1 long (varint raw pattern), 2 double, 3 string UTF-8 inline, 4 PoolRef (strings: POOL-REF tag / objects: bare u32 key), 5 char-array (varint code units), 6 bool (raw byte), 7 bytes (BYTES tag, major 0), 8 Composite (values by field name), 9 Array (constantPool array items = PoolRef).",
+    "fields": [{
+        "name": "v", "type": [
+            "null",
+            "long",
+            "double",
+            "string",
+            {"type": "record", "name": "PoolRef", "fields": [
+                {"name": "typeId", "type": "long", "doc": "the pooled type (the string type for tag-2 refs)"},
+                {"name": "key", "type": "long"}]},
+            {"type": "record", "name": "CharArray", "fields": [
+                {"name": "units", "type": {"type": "array", "items": "int"},
+                 "doc": "code units; readChar = varint"}]},
+            "boolean",
+            "bytes",
+            {"type": "record", "name": "Composite", "fields": [
+                {"name": "fields", "type": {"type": "array", "items": "virel.model.NamedFieldValue"}}]},
+            {"type": "record", "name": "Array", "fields": [
+                {"name": "items", "type": {"type": "array", "items": "virel.model.FieldValue"}}]}
+        ]}]
+}
+
+
+header = {
+    "type": "record", "name": "Header",
+    "doc": "byte-positioned chunk header (Kaitai-expressible; the .ksy artifact checks this against binaries). Annex: 68 B, magic=FLR\\0, majors 1/2, BYTE-FROZEN (JFR). Native: magic=VIRL, same offsets 4..67, majors 0 (draft) and 1 (stable). Flags @66 bit 7 (0x80) = VIREL-NATIVE signature (set for VIRL, always clear in the FLR annex - JFR v2 writes @66=0 and never reads byte 66, verified); bits 0..6 = metadata-default encoding id (0..127); writerId at offset 68 = u64 random (0 = writer-unspecified). Annex low flags byte @67: bit 0 = varint regime, bit 1 = FINAL-CHUNK. State @64: 0=COMPLETE, 255=UPDATING (seqlock double-read before trusting posthoc fields).",
+    "fields": [
+        {"name": "magic", "type": "bytes", "doc": "FLR\\0 for the JFR annex; VIRL for native chunks"},
+        {"name": "major", "type": "int"},
+        {"name": "minor", "type": "int"},
+        {"name": "chunkSize", "type": "long", "doc": "back-patched at finalize (padded varint in the wire; annex initial = 68)"},
+        {"name": "stateSnapshotOffset", "type": "long", "doc": "chunk-relative; JFR annex = LAST checkpoint, native = LAST state snapshot; delta walks backward; 0 = none"},
+        {"name": "metadataOffset", "type": "long", "doc": "chunk-relative; MAY move mid-chunk"},
+        {"name": "startNanos", "type": "long", "doc": "UTC ns; written at open; stable"},
+        {"name": "durationNanos", "type": "long", "doc": "posthoc at finalize; 0 while live"},
+        {"name": "startTicks", "type": "long", "doc": "anchor: annex event ticks ABSOLUTE (FastUnordered, non-monotonic by design); native event ticks CHUNK-RELATIVE, per-writer non-decreasing"},
+        {"name": "ticksPerSecond", "type": "long"},
+        {"name": "state", "type": "int", "doc": "0 = COMPLETE, 255 = UPDATING"},
+        {"name": "flags", "type": "int"},
+        {"name": "writerId", "type": ["null", "long"], "default": None, "doc": "native only (76-byte header); null for annex"}
+    ]
+}
+
+attr = {
+    "type": "record", "name": "Attribute",
+    "fields": [{"name": "name", "type": "int"}, {"name": "value", "type": "int"}]
+}
+
+element = {
+    "type": "record", "name": "Element",
+    "doc": "binarized-XML element tree (xml-v2 grammar). BARE pool refs, no tags.",
+    "fields": [
+        {"name": "name", "type": "int"},
+        {"name": "attributes", "type": {"type": "array", "items": "virel.model.Attribute"}},
+        {"name": "children", "type": {"type": "array", "items": "virel.model.Element"}}
+    ]
+}
+
+entry = {
+    "type": "record", "name": "Entry",
+    "doc": "key: u32 in the wire, 0 = null; value: FULL payload always written (dedup = reader-level only).",
+    "fields": [{"name": "key", "type": "long"}, {"name": "value", "type": "virel.model.FieldValue"}]
+}
+
+pool = {
+    "type": "record", "name": "Pool",
+    "fields": [
+        {"name": "typeId", "type": "long"},
+        {"name": "entries", "type": {"type": "array", "items": "virel.model.Entry"}}]
+}
+
+state_snapshot = {
+    "type": "record", "name": "StateSnapshot",
+    "doc": "[typeId=1][startTime][duration][delta][snapshotFlags:u1] then, if native snapshotFlags bit 7 TYPE_SUMMARY_PRESENT is set, [summaryVersion=1][summaryTypeCount][typeId,emittedCount]* before [poolCount][pools...]. Bit 0 is FLUSH; all other flag bits are zero. The summary is cumulative within the chunk, sorted by type id, and excludes bootstrap ids 0/1. Pool validity = THIS chunk (writer-scoped); delta = previous state snapshot offset (backward chain; 0 = first).",
+    "fields": [
+        {"name": "startTime", "type": "long"},
+        {"name": "duration", "type": "long"},
+        {"name": "delta", "type": "long"},
+        {"name": "flush", "type": "boolean"},
+        {"name": "summaryVersion", "type": "int", "default": 0},
+        {"name": "hasTypeSummary", "type": "boolean", "default": False},
+        {"name": "typeSummary", "type": {"type": "array", "items": {
+            "type": "record", "name": "TypeCount",
+            "fields": [
+                {"name": "typeId", "type": "long"},
+                {"name": "emittedCount", "type": "long"}
+            ]}}, "default": []},
+        {"name": "pools", "type": {"type": "array", "items": "virel.model.Pool"}}
+    ]
+}
+
+metadata = {
+    "type": "record", "name": "Metadata",
+    "doc": "annex preamble = [startTime][duration][metadataId]; native adds the envelope: [encodingId varint][payload]. Encoding-0 payload = [poolSize][strings][root element]. The root carries 'metadata' and 'region' children; the XML element for a type is literally 'class'; a field's linked type id rides in the 'class' attribute; event types declare startTime, optionally duration, then eventThread/stackTrace (constantPool attr) and user fields - no hidden event words (validated in gate 1).",
+    "fields": [
+        {"name": "startTime", "type": "long"},
+        {"name": "duration", "type": "long"},
+        {"name": "metadataId", "type": "long", "doc": "reader-caching affordance only"},
+        {"name": "encodingId", "type": "int", "doc": "annex: implicitly 0"},
+        {"name": "stringPool", "type": {"type": "array", "items": ["null", "string"]}},
+        {"name": "root", "type": "virel.model.Element"}
+    ]
+}
+
+event = {
+    "type": "record", "name": "Event",
+    "doc": "wire = [sizeInclOwnWidth][typeId][startTime][durationTicks iff 'duration' declared][fields in declared order]; unknown types ride GenericDyn: body FieldValues against the chunk's metadata; skip-by-size for foreign/unknown bodies is a native-wire property (retained there, not in Avro renders).",
+    "fields": [
+        {"name": "typeId", "type": "long"},
+        {"name": "startTicks", "type": ["null", "long"], "default": None,
+         "doc": "null for bridge-internal uses without time words"},
+        {"name": "durationTicks", "type": ["null", "long"], "default": None},
+        {"name": "values", "type": {"type": "array", "items": "virel.model.NamedFieldValue"}, "default": []}
+    ]
+}
+
+registry = {
+    "type": "record", "name": "Registry",
+    "doc": "spec-level registries as model records (append-only in the spec text).",
+    "fields": [
+        {"name": "valueModel", "type": FieldValue},
+        {"name": "wireModel", "type": {
+            "type": "record", "name": "WireModel",
+            "doc": "anchored wire-layer types (dependency order; referenced by name from the chunk tree).",
+            "fields": [
+                {"name": "header", "type": header},
+                {"name": "attribute", "type": attr},
+                {"name": "element", "type": element},
+                {"name": "entry", "type": entry},
+                {"name": "pool", "type": pool},
+                {"name": "stateSnapshot", "type": state_snapshot},
+                {"name": "metadata", "type": metadata},
+                {"name": "event", "type": event},
+                {"name": "namedFieldValue", "type": nfv_named}]}},
+        {"name": "typeIdSpace", "type": {
+            "type": "record", "name": "TypeIdSpace",
+            "doc": "Bindings: container-global, ADD-ONLY, never re-bound; redefinition = violation. 0=metadata event, 1=state snapshot (JFR checkpoint; bootstrap, fixed in ALL majors; v2-verified). [2,2^30): module-registered, ledger-assigned (moduleId u12)<<18|(local u18) = 4096 modules x 262144 types. [2^30,2^62): dynamic, writer-assigned per container, add-only. [2^62,2^64): system/reserved. Snapshot completeness: normative, no omissions (mid-chunk state snapshots rebuild from snapshots, not diffs).",
+            "fields": [
+                {"name": "moduleIdBits", "type": "int", "default": 12},
+                {"name": "localIdBits", "type": "int", "default": 18}]}},
+        {"name": "moduleLedger", "type": {"type": "array", "items": {
+            "type": "record", "name": "Module",
+            "doc": "append-only module registry: 0 framing (sync kinds, provenance, attachment-fragment); 1 jfr-core; 2 exec-trace (Go/Perfetto-modeled execution vocabulary: task/executor states, slices, instants, counters + units, STATE tracks, timebase-neutral stack samples, per-sequence numbers); 3 otlp-profiles (pprof/OTLP Profiles mapping); 4+ community ledger.",
+            "fields": [
+                {"name": "id", "type": "int"},
+                {"name": "name", "type": "string"}]}}},
+        {"name": "syncKinds", "type": {"type": "array", "items": {
+            "type": "enum", "name": "SyncKind",
+            "doc": "registered sync-point kinds (module m0; numerics ratified): STATE_SNAPSHOT = typeId 1 (pools/state plus an optional native cumulative type summary; JFR alias CHECKPOINT); CLOCK = multi-clock extension table (clock-id, value, frequency) + per-event clock ref = declared field (extension, not v1.0); LOSS = ring-buffer lost ranges (Perfetto previous_packet_dropped analog); CLEAR = incremental-state-cleared (SEQ_INCREMENTAL_STATE_CLEARED analog); END_OF_PARTITION = Go EndOfGeneration / finalize marker. Cadence: writers SHOULD write state snapshots within a durability window (<= 1s event time or <= a few MB).",
+            "symbols": ["STATE_SNAPSHOT", "CLOCK", "LOSS", "CLEAR", "END_OF_PARTITION"]}}},
+        {"name": "metadataEncodings", "type": {"type": "array", "items": {
+            "type": "record", "name": "Encoding",
+            "doc": "envelope encoding registry (append-only; envelope tag authoritative; header @66 bits0..6 = advisory default; within-chunk changes permit-but-discourage): 0=xml-v2 (byte-frozen annex grammar; ALSO legal for native chunks - verified in gate 2), 1=flat, 2=protobuf, 3=CBOR, 4=JSON, 5=avro. All express the SAME logical model.",
+            "fields": [
+                {"name": "id", "type": "int"},
+                {"name": "name", "type": "string"}]}}},
+        {"name": "provenance", "type": {
+            "type": "record", "name": "Provenance",
+            "doc": "standardized converted-stream provenance (declared metadata type, module m0; emitted per chunk) - ratified 2026-10-03.",
+            "fields": [
+                {"name": "sourceFormat", "type": "string", "doc": "STRING-first ('go-trace','perfetto-pb','pprof-gz','linux','etw','ctef','cpuprofile',...); no registry required; optional well-known ids later, additive"},
+                {"name": "sourceFormatVersion", "type": "string"},
+                {"name": "converter", "type": "string", "doc": "converter identity/version"},
+                {"name": "fidelity", "type": {"type": "enum", "name": "Fidelity",
+                    "doc": "LOSSY_PARTIAL_ATTACHMENT = the standard lossy mode (fragments only); FULL discouraged (tiny sources)",
+                    "symbols": ["LOSSLESS", "LOSSY_PARTIAL_ATTACHMENT", "LOSSY_FULL_ATTACHMENT", "LOSSY_NO_ATTACHMENT"]}},
+                {"name": "originalPayloadHash", "type": "long", "doc": "u64 over attached fragment bytes; 0 = none"}]}},
+        {"name": "attachmentFragment", "type": {
+            "type": "record", "name": "AttachmentFragment",
+            "doc": "'only the non-recoded parts' (ratified): one per lossy element; fragment = ORIGINAL encoding untouched; attachment budget SHOULD stay a small fraction of stream size; consumers MUST NOT auto-interpret attachment bytes.",
+            "fields": [
+                {"name": "sourceLocator", "type": "long", "doc": "u64 offset (source file/batch/message)"},
+                {"name": "coordString", "type": ["null", "string"], "default": None,
+                 "doc": "per-format coordinate (pprof field-number path, perf.data feature offset, CTF type ref, CTEF object path, ETW buffer/record offset) documented with each Tier-B converter"},
+                {"name": "reason", "type": {"type": "enum", "name": "FragmentReason",
+                    "symbols": ["EXTENSION_UNMAPPED", "SEMANTICS_UNMAPPED", "TYPE_UNREPRESENTABLE"]}},
+                {"name": "fragment", "type": "bytes"}]}},
+        {"name": "conversion", "type": {
+            "type": "record", "name": "Conversion",
+            "doc": "converter = validator (same artifact, ratified). Go = bounded per-generation (~16 MiB ceiling, the source's own granularity); Perfetto = streaming 1:1 via mid-chunk checkpoints; pprof/OTLP = table-driven off the profiles mapping; Tier B = shape-folds (CTEF/cpuprofile, perf.data, ftrace, CTF, ETW) + CTEF emitter first (adoption wedge). SLICE_BEGIN/END stay PAIRS (a streaming writer cannot back-patch a duration into a written position; folding = read-side, as CTEF B/E).",
+            "fields": [
+                {"name": "tier", "type": {"type": "enum", "name": "Tier",
+                    "symbols": ["A_LOSSLESS_ROUNDTRIP", "B_SHAPE_FOLD"]}},
+                {"name": "sourceFormat", "type": "string"}]}},
+        {"name": "foreignChunk", "type": {
+            "type": "record", "name": "ForeignChunk",
+            "doc": "bridged, never interpreted: skip via FLR or VIRL magic re-scan; candidate accepted only for an implemented (magic, signature, major, minor) class; diagnostic layers SHOULD report foreign spans; support for future formats = pure additive spec revision.",
+            "fields": [
+                {"name": "firstOffset", "type": "long"},
+                {"name": "nextOffset", "type": "long"}]}}
+    ]
+}
+
+chunk = {
+    "type": "record", "name": "Chunk",
+    "doc": "self-contained partition; chunk = ONE writer (one-writer-per-chunk, ratified).",
+    "fields": [
+        {"name": "index", "type": "int"},
+        {"name": "class", "type": {"type": "enum", "name": "ChunkClass",
+            "doc": "annex = byte-frozen JFR FLR majors 1/2 (signature clear); native = VIREL VIRL 0 (draft) / 1 (stable) (signature set); foreign = NOT parsed, bridged (virel.model.ForeignChunk).",
+            "symbols": ["ANNEX", "NATIVE", "FOREIGN"]}, "default": "NATIVE"},
+        {"name": "major", "type": "int"},
+        {"name": "minor", "type": "int"},
+        {"name": "header", "type": "virel.model.Header"},
+        {"name": "metadata", "type": ["null", "virel.model.Metadata"], "default": None},
+        {"name": "stateSnapshots", "type": {"type": "array", "items": "virel.model.StateSnapshot"}, "default": []},
+        {"name": "events", "type": {"type": "array", "items": "virel.model.Event"}, "default": []},
+        {"name": "foreignSpans", "type": {"type": "array", "items": "virel.model.ForeignChunk"}, "default": []}
+    ]
+}
+
+container = {
+    "type": "record", "name": "Container", "namespace": "virel.model",
+    "doc": "TCF protocol model, FULL. Ratified OPTION C (2026-10-03, find-avro-full-model): machine-readable model artifact (documentation + validator model-lint + codegen source). The NATIVE wire (TraceContainerFormat.md) is the sole normative byte encoding; an Avro-wire profile is deliberately NOT registered (an Avro container cannot express per-event sizes/skip, live seqlock, chunk resync/foreign bridging, mid-stream type introduction). The reference bridge library carries native<->model duty; fidelity = its test suite, not this text. Named types defined at first use, referenced by name after (backward-only resolution).",
+    "fields": [
+        {"name": "registry", "type": registry},
+        {"name": "chunks", "type": {"type": "array", "items": chunk}}
+    ]
+}
+
+out = json.dumps(container, indent=2, ensure_ascii=False)
+path = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent.parent / "doc" / "tcf-model.avsc")
+open(path, "w").write(out + "\n")
+doc = json.load(open(path))
+
+seen, missing = set(), []
+def walk(node):
+    if isinstance(node, dict):
+        nm = node.get("name")
+        if isinstance(nm, str) and nm[:1].isupper() and isinstance(node.get("type"), (dict, str)):
+            seen.add(nm)
+        t = node.get("type")
+        if isinstance(t, str) and t[:1].isupper() and t not in seen:
+            missing.append(t)
+        for v in node.values(): walk(v)
+    elif isinstance(node, list):
+        for v in node: walk(v)
+walk(doc)
+types_ = []
+def collect(node, acc):
+    if isinstance(node, dict):
+        t = node.get("type")
+        nm = node.get("name")
+        if isinstance(nm, str) and nm[:1].isupper() and (t in ("record", "enum", "fixed") or (isinstance(t, dict) and t.get("type") in ("record", "enum", "fixed"))):
+            acc.append(nm)
+        for v in node.values(): collect(v, acc)
+    elif isinstance(node, list):
+        for v in node: collect(v, acc)
+collect(doc, types_)
+from collections import Counter
+dups = [n for n, c in Counter(types_).items() if c > 1]
+print(f"avsc written: {path} ({len(out.splitlines())} lines)")
+print("root:", doc["name"], "| registry fields:", [f["name"] for f in registry["fields"]])
+print("forward refs (must be none):", sorted(set(missing)) or "none")
+print("named types:", len(types_), "| duplicates:", dups or "none")
