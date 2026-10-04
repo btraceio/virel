@@ -4,8 +4,10 @@ Versioned In-band Runtime Event Ledger: a draft binary format for fine-grained
 runtime observability, designed for low-overhead recording and self-contained,
 self-describing chunks.
 
-The protocol remains draft **0.1**, revised in place during design. Native magic
-is `VIRL`; `FLR\0` belongs to the byte-frozen JFR annex. Bootstrap records are
+The protocol remains draft **0.1**, revised in place during design. Every VIREL
+file is a format-agnostic container of framed streams (signature
+`\x89VRL\r\n\x1a\n`); native VIREL (chunk magic `VIRL`), JFR (`FLR\0`, byte-frozen),
+Go trace, Perfetto and others are payload formats. Native bootstrap records are
 Metadata and State Snapshot, with optional cumulative event-type counts in the
 latter.
 

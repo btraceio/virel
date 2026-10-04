@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Gate 4: pprof (Go runtime/pprof output, real producer) -> native VIREL.
-Pools = per-pool checkpoint events (find-pool-skip (b) ratified).
+"""Gate 4: WIRE REGRESSION TEST using a pprof fixture (Go runtime/pprof output, real producer).
+Since 2026-10-04 (find-event-scope) pprof is out of VIREL's scope: this is NOT a format profile.
+It is kept because it exercises wire rules every VIREL stream depends on: pooled-reference
+encoding (bare keys for non-string pools), Varint128 9-byte values, and per-pool skippable
+state snapshots (find-pool-skip (b) ratified).
 
 Stage A: decode the pprof protobuf (generic wire reader, NO protoc; field
          map verified against GOROOT/src/internal/profile/encode.go, the
          hand-written reference encoder) and cross-check structurally
          against `go tool pprof -raw`.
-Stage B: emit native VIREL chunks (one per profile; module m3 =
-         otlp-profiles vocabulary per find-otlp-profile-mapping: pooled
-         valuetype/function/mapping/location + sample rows as events with
-         the defined filler time word), reconstruct and prove exact
+Stage B: emit native VIREL chunks (one per profile; types in the DYNAMIC id range,
+         since the withdrawn otlp-profiles module no longer exists: pooled
+         valuetype/function/mapping/location + sample rows as events with a
+         test-only filler time word), reconstruct and prove exact
          fidelity + MODEL-LINT.
 """
 import sys, os, struct, gzip, subprocess, time
@@ -269,8 +272,8 @@ def crosscheck(prof, got, name):
             errs.append(f"mapping {mid} file {gf!r} vs {gg[3]!r}")
     return errs
 
-# ---------------- stage B: emit native VIREL (module m3) -------------------
-M3 = 3 << 18
+# ---------------- stage B: emit native VIREL (dynamic type ids) -------------
+M3 = 1 << 30          # first DYNAMIC type id (spec §5.3); was module 3, now withdrawn
 TVT, TFUN, TMAP, TLOC, TLINE, TLBL, TSMP, TPER, TSTS, TMSC = \
     M3 | 1, M3 | 2, M3 | 3, M3 | 4, M3 | 5, M3 | 6, M3 | 7, M3 | 8, M3 | 9, M3 | 10
 T_SLB, T_SLE, T_INS, T_CNTR = 2, 3, 4, 5

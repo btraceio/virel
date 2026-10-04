@@ -72,7 +72,17 @@ def to_model(data: bytes) -> dict:
                         "typeSummary": cp["typeSummary"], "pools": pools})
         chunk["stateSnapshots"] = cps
         chunks.append(chunk)
-    return {"registry": avsc_registry(), "chunks": chunks}
+    # Inputs are bare chunk streams; spec §3.8 opens them as an implicit container
+    # with one stream whose format follows the leading magic.
+    fmt = "jfr" if data[:4] == b"FLR\0" else "virel"
+    stream = {"streamId": 1, "descriptor": {"format": fmt}, "records": [],
+              "complete": True, "decoder": fmt, "chunks": chunks}
+    return {"registry": avsc_registry(),
+            "header": {"major": 0, "minor": 0, "headerSize": 32, "flags": 0, "containerId": 0},
+            "streams": [stream], "cleanlyClosed": False, "implicit": True}
+
+def model_chunks(model) -> list:
+    return [c for st in model["streams"] for c in (st.get("chunks") or [])]
 
 def model_element(el) -> dict:
     return {"name": el["n"],
@@ -204,7 +214,7 @@ def main():
         data = open(path, "rb").read()
         model = to_model(data)
         errs = lint(model)
-        print(f"{path}: chunks={len(model['chunks'])} lint-errors={len(errs)}")
+        print(f"{path}: streams={len(model['streams'])} chunks={len(model_chunks(model))} lint-errors={len(errs)}")
         for e in errs[:12]: print("   !", e)
         print("   MODEL-LINT:", "PASSED" if not errs else "FAILED")
     return 0
