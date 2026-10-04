@@ -12,7 +12,13 @@ latter.
 - [Protocol specification](doc/TraceContainerFormat.md)
 - [RFC](doc/tcf-rfc.md)
 - [Current work and open writer issues](WORK.md)
+- [Writer capture/encoding benchmark](benchmarks/README.md)
+- [Pooled generation/native writer benchmark](benchmarks/generation-writer.md)
+- [Writer direction and proposed generation ownership](doc/writer-design.md)
 - [Investigation index](INDEX.md) and [historical state](STATE.md)
+- [Active investigation memory](.investigations/jfr-spec/INDEX.md) and
+  [working state](.investigations/jfr-spec/STATE.md), maintained with Pi's
+  investigation-memory workflow
 - [Schemas and framing artifacts](doc/)
 - [Reference readers and conversion validators](validators/)
 
