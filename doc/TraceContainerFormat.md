@@ -513,7 +513,7 @@ Native chunks use `VIRL` at offsets 0..3; offsets 4..67 retain the Annex
 | 4..65 | | as annex | |
 | 64 | 1 | file state | 0 = COMPLETE; 0xff = UPDATING |
 | 65 | 1 | pad | |
-| 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK; bit 2 = STREAMING (§3.9.6, PROPOSED) (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
+| 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK; bit 2 = STREAMING (streaming vs finalized header state, §3.9.6, PROPOSED) (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
 | 68 | 8 | **writer id (NEW)** | `u64` BE, random per writer (Perfetto-TrackDescriptor-uuid style); discoverable at chunk attach; required by the one-writer-per-chunk rule [find-superset-goal] |
 
 **Ratified**: writer-id = 64-bit random (zero = null/writer-unspecified,
@@ -574,11 +574,27 @@ readers skip what they do not know and never clash with a version space
 they cannot coordinate with. Supporting a future JFR annex (e.g. real JFR
 major 3) is later a pure spec revision, additive in both directions.
 
-#### 3.9.6 Streaming chunks (native only; PROPOSED 2026-10-05)
+#### 3.9.6 Streaming chunks and finalization (native only; PROPOSED 2026-10-05)
 
-A writer that cannot seek writes **streaming chunks** [find-container-split]:
+A native chunk header is in one of two states, and readers tell them apart
+from the header alone:
 
-- The header is written once and never patched: `chunk size` = 0, last
+| state | STREAMING (@67 bit 2) | chunk size | extent | how a reader skips it |
+|---|---|---|---|---|
+| **streaming** | set | 0 | through its END_OF_PARTITION event | walk the size-prefixed events (O(events)) |
+| **finalized** | clear | > 0 | `chunk size` bytes | jump by the size field (O(1)) |
+
+A non-zero `chunk size` is authoritative even while STREAMING is still set: a
+reader can then be looking at a chunk mid-finalization.
+
+Streaming chunks serve live transport on sinks that cannot seek (pipes,
+sockets, append-only uploads). Finalized chunks serve storage and
+distribution. Producers SHOULD distribute finalized VIRL; streaming VIRL is
+for when streaming is requested [find-container-split].
+
+**Writing streaming chunks.** A writer that cannot seek writes them:
+
+- The streaming writer writes the header once and never patches it: `chunk size` = 0, last
   state snapshot offset = 0, duration = 0, state = 0x00, STREAMING flag set
   (@67 bit 2), FINAL-CHUNK clear. Metadata offset, start nanos, start ticks,
   ticks per second and writer id hold their normal values; the metadata
@@ -599,6 +615,27 @@ A writer that cannot seek writes **streaming chunks** [find-container-split]:
   FINAL-CHUNK marker: a stream ends cleanly when its last chunk is complete.
 - A writer on a seekable sink MAY still write streaming chunks. JFR annex
   chunks (majors 1/2) have no streaming mode; they stay byte-frozen.
+
+**Finalization.** Once a streaming chunk is complete (its END_OF_PARTITION is
+present), a finalizer MAY turn it into a finalized chunk. It works in place on
+a seekable medium or on a copy.
+
+- It writes only header posthoc fields. `chunk size` gets the walked extent.
+  The last state snapshot offset gets the chunk-relative offset of the last
+  state snapshot before END_OF_PARTITION (0 if none). FINAL-CHUNK is set on
+  the last chunk when the whole stream ended cleanly (every chunk complete).
+  STREAMING is cleared.
+- Duration stays 0 unless the finalizer knows it. In a finalized native chunk,
+  0 means unknown.
+- Order (normative): the finalizer writes `chunk size` and the other posthoc
+  fields first, and clears STREAMING last. A concurrent reader therefore
+  never sees size 0 with STREAMING clear.
+- No byte outside those header fields changes; event bytes are identical
+  before and after. Finalization is idempotent. An incomplete trailing chunk
+  stays streaming, so files with streaming and finalized chunks mixed are
+  valid.
+- A writer that can seek MAY finalize each chunk itself when it closes it.
+  That yields the same header as live finalized writing (§3.9.3).
 
 ---
 

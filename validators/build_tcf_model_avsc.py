@@ -40,7 +40,7 @@ header = {
         {"name": "magic", "type": "bytes", "doc": "FLR\\0 for the JFR annex; VIRL for native chunks"},
         {"name": "major", "type": "int"},
         {"name": "minor", "type": "int"},
-        {"name": "chunkSize", "type": "long", "doc": "back-patched at finalize (annex initial = 68); 0 in a native streaming chunk (flags @67 bit 2 STREAMING), whose extent ends at its END_OF_PARTITION event (type id 8)"},
+        {"name": "chunkSize", "type": "long", "doc": "back-patched at finalize (annex initial = 68); 0 in a native streaming chunk (flags @67 bit 2 STREAMING), whose extent ends at its END_OF_PARTITION event (type id 8); finalization writes it and clears STREAMING (spec §3.9.6)"},
         {"name": "stateSnapshotOffset", "type": "long", "doc": "chunk-relative; JFR annex = LAST checkpoint, native = LAST state snapshot; delta walks backward; 0 = none"},
         {"name": "metadataOffset", "type": "long", "doc": "chunk-relative; MAY move mid-chunk"},
         {"name": "startNanos", "type": "long", "doc": "UTC ns; written at open; stable"},

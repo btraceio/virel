@@ -29,20 +29,11 @@ class ModelComposite(dict):
 
 # ---------- chunk extent (spec §3.9, §3.9.6) ----------
 
-def chunk_extent(d, pos):
-    """(length, complete) of the chunk starting at pos.
-    A finalized chunk declares its size at offset 8. A streaming chunk (native, size 0,
-    STREAMING flag) is never back-patched: it extends through its END_OF_PARTITION event,
-    found by walking size-prefixed events. A streaming chunk cut before its terminator runs
-    to the end of the data and is incomplete."""
-    if pos + 76 > len(d):
-        return len(d) - pos, False
-    size = struct.unpack_from(">Q", d, pos + 8)[0]
-    if size:
-        return min(size, len(d) - pos), pos + size <= len(d)
-    if d[pos:pos + 4] != MAGIC_NATIVE or not d[pos + 67] & FLAG_STREAMING:
-        return len(d) - pos, False
-    p = pos + 76
+def walk_streaming_chunk(d, pos):
+    """walk a streaming chunk's size-prefixed events from offset 76 through END_OF_PARTITION.
+    Returns (length, complete, last_state_snapshot_offset) with the offset chunk-relative,
+    0 if none. An incomplete chunk (no terminator) runs to the end of the data."""
+    p, last_snapshot = pos + 76, 0
     try:
         while p < len(d):
             cur = Cursor(d, p)
@@ -50,12 +41,36 @@ def chunk_extent(d, pos):
             if n <= 0 or p + n > len(d):
                 break
             tid = cur.varint()
+            if tid == 1:
+                last_snapshot = p - pos
             p += n
             if tid == TYPE_END_OF_PARTITION:
-                return p - pos, True
+                return p - pos, True, last_snapshot
     except (IOError, IndexError):
         pass
-    return len(d) - pos, False
+    return len(d) - pos, False, last_snapshot
+
+def is_streaming_header(d, pos):
+    """streaming state: native magic, STREAMING flag set, size field 0 (spec §3.9.6). A
+    non-zero size is authoritative even while the flag is still set (mid-finalization)."""
+    return (pos + 76 <= len(d) and d[pos:pos + 4] == MAGIC_NATIVE and d[pos + 67] & FLAG_STREAMING != 0
+            and struct.unpack_from(">Q", d, pos + 8)[0] == 0)
+
+def chunk_extent(d, pos):
+    """(length, complete) of the chunk starting at pos.
+    A finalized chunk declares its size at offset 8. A streaming chunk (native, size 0,
+    STREAMING flag) is never back-patched by its writer: it extends through its
+    END_OF_PARTITION event, found by walking size-prefixed events. A streaming chunk cut
+    before its terminator runs to the end of the data and is incomplete."""
+    if pos + 76 > len(d):
+        return len(d) - pos, False
+    size = struct.unpack_from(">Q", d, pos + 8)[0]
+    if size:
+        return min(size, len(d) - pos), pos + size <= len(d)
+    if not is_streaming_header(d, pos):
+        return len(d) - pos, False
+    n, complete, _ = walk_streaming_chunk(d, pos)
+    return n, complete
 
 # ---------- cursor ----------
 

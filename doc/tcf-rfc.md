@@ -216,7 +216,7 @@ Offsets 0 to 67 keep the annex semantics and positions. The size is major-scoped
 | 0..65 | | as annex | |
 | 64 | 1 | file state | 0 = COMPLETE; 0xff = UPDATING |
 | 65 | 1 | pad | |
-| 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK; bit 2 = STREAMING (section 3.9.6, PROPOSED) (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
+| 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK; bit 2 = STREAMING (streaming vs finalized header state, section 3.9.6, PROPOSED) (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
 | 68 | 8 | **writer id (NEW)** | `u64` BE, random per writer (Perfetto-TrackDescriptor-uuid style); discoverable at chunk attach; required by the one-writer-per-chunk rule [find-superset-goal] |
 
 Ratified by proceed (2026-10-03): the writer id is a 64-bit random value. Zero means null (writer-unspecified). Single-writer converters MAY use zero instead of an id.
@@ -239,9 +239,13 @@ Within a `virel` or `jfr` stream, a chunk is FOREIGN when the decoder does not s
 
 This gives structural resilience to any JFR evolution and to future VIREL majors. Readers skip unknown chunks; they never clash with uncoordinated version spaces. The resilience is additive in both directions.
 
-#### 3.9.6 Streaming chunks (native only; PROPOSED)
+#### 3.9.6 Streaming chunks and finalization (native only; PROPOSED)
 
-A writer that cannot seek writes streaming chunks. The header is written once and never patched: chunk size 0, last state snapshot offset 0, duration 0, state 0x00, STREAMING set, FINAL-CHUNK clear; metadata offset, start nanos, start ticks, frequency, and writer id hold their normal values, and the metadata event SHOULD come first. The chunk MUST end with an END_OF_PARTITION event (type id 8). A reader finds the extent by walking size-prefixed events through that event. State snapshots chain backward from the last one before END_OF_PARTITION, whose type summary indexes the chunk; the seqlock does not apply. A live reader consumes each event once it is fully present. A streaming chunk without END_OF_PARTITION at end of data is incomplete. JFR annex chunks have no streaming mode.
+A native chunk header is either streaming (STREAMING set, chunk size 0: the extent runs through END_OF_PARTITION, and a reader skips it by walking events) or finalized (STREAMING clear, chunk size > 0: a reader skips it by its size). A non-zero chunk size is authoritative even while STREAMING is still set. Streaming chunks serve live transport; finalized chunks serve storage and distribution, and producers SHOULD distribute finalized VIRL.
+
+A writer that cannot seek writes streaming chunks. The header is written once and never patched by that writer: chunk size 0, last state snapshot offset 0, duration 0, state 0x00, STREAMING set, FINAL-CHUNK clear; metadata offset, start nanos, start ticks, frequency, and writer id hold their normal values, and the metadata event SHOULD come first. The chunk MUST end with an END_OF_PARTITION event (type id 8). State snapshots chain backward from the last one before END_OF_PARTITION, whose type summary indexes the chunk; the seqlock does not apply. A live reader consumes each event once it is fully present. A streaming chunk without END_OF_PARTITION at end of data is incomplete. JFR annex chunks have no streaming mode.
+
+Finalization turns a complete streaming chunk into a finalized one, in place or on a copy. It writes only header posthoc fields: chunk size, the last state snapshot offset, FINAL-CHUNK on the last chunk of a cleanly ended stream, and, last of all, STREAMING cleared. Duration stays 0 (unknown) unless the finalizer knows it. Event bytes never change, finalization is idempotent, and an incomplete trailing chunk stays streaming (mixed files are valid).
 
 Evidence: find-version-resilience, ev-chunk-header, ev-framing-constants, ev-live-header-protocol, find-superset-goal, find-container-split.
 

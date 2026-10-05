@@ -521,3 +521,72 @@ nested `SIGPROF` at one of four points:
 The memory cost of extra levels is one more lane ring per thread per level.
 With global's ~18-byte records a nested level can use a small ring; the
 prototype uses equal sizes.
+
+## VIRL streaming chunks
+
+Streaming chunks (spec §3.9.6) write each chunk header once with size 0 and the
+STREAMING flag, and end the chunk with END_OF_PARTITION. The writer never seeks,
+so `--streaming 1` also works on a pipe or FIFO. A finalized writer instead
+rewrites the 76-byte header in place on every publication: a seek plus a write
+when the output is a file. It fails on a FIFO with `header write`.
+
+```
+python3 -B benchmarks/run_generation_writer.py --suite streaming \
+  --events 20000 --repeats 5 --output evidence/generation-writer-streaming.json
+```
+
+The suite has two parts.
+- **Verification:** the native, publication and signal correctness cases rerun
+  with streaming chunks, to a file and once through a FIFO. Every output is
+  independently validated.
+- **Measurement:** three scenarios run with real output, each to three sinks:
+  `finalized-file`, `streaming-file` and `streaming-fifo` (a FIFO drained by the
+  runner). Unlike the other suites, these timed runs write the output, because
+  avoiding the I/O is the point.
+
+### Results
+
+[45 runs](../evidence/generation-writer-streaming.md),
+[raw JSON](../evidence/generation-writer-streaming.json),
+[source](../evidence/generation-streaming-source.cpp). Validation covered 8
+verified streaming runs, one through a FIFO: 1,219 chunks, 368,203 events and
+39,639 samples.
+
+- **Header rewrites:** finalized output rewrote headers 1,524–18,870 times per
+  run; streaming rewrote none.
+- **Writer CPU per committed event:** no consistent overhead. Medians ranged
+  from −35% (many 1 ms chunks to a file) to +12% (16 threads with samples into
+  a FIFO). Every streaming range overlaps the finalized range. An earlier
+  recording on the same host gave −0.6% to −25%, so run-to-run noise on this
+  host exceeds any streaming effect.
+- **Producer call p99:** no systematic difference; ranges overlap.
+- **Bytes per committed event:** the same within run-to-run timing noise.
+  Streaming adds no bytes: the header is the same size and END_OF_PARTITION
+  was already written.
+- **Loss:** none in any run.
+- **Reader cost to find chunk boundaries:**
+  - A finalized chunk is skipped by its size field: ~0.6 µs per chunk in
+    Python, whatever the chunk size.
+  - A streaming chunk must be walked event by event to END_OF_PARTITION:
+    0.5–9 ms per chunk here, ×800 to ×16,000. That is pure Python; a native
+    reader is far faster, but it stays O(events).
+  - This matters only for skipping and random access. A sequential reader
+    decodes every event anyway.
+
+### Finalization
+
+Finalization (spec §3.9.6) patches only the posthoc header fields, clears
+STREAMING last, and leaves event bytes unchanged. Streaming output therefore
+serves live transport and is finalized once for distribution:
+
+- **Cost:** one event walk per chunk plus three small header writes. In place,
+  in Python, that is 2.4–3.0 µs per event (0.6–10 ms per chunk), about the
+  cost of a single streaming index pass.
+- **After finalization:** the same index pass costs 0.6–0.9 µs per chunk
+  (×0.9–1.3 of natively finalized output). Fast skips come back.
+- **Correctness (GATE 7 step 6):**
+  - only header size, last-snapshot and flags bytes change;
+  - running it twice changes nothing; in place equals a copy;
+  - the result validates as finalized output;
+  - an incomplete tail stays streaming;
+  - a header seen mid-finalization reads correctly.

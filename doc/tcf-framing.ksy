@@ -4,7 +4,8 @@
 #   - VIRL, the native event stream, and the `virel`/`jfr` chunk-stream payloads: type
 #     `chunk_stream`, for a VIRL file or a stream reconstructed from its DATA payloads.
 #     Streaming chunks (size 0, STREAMING flag) are walked event by event to
-#     END_OF_PARTITION (spec §3.9.6).
+#     END_OF_PARTITION; finalized chunks (STREAMING clear, size > 0) are sized
+#     (spec §3.9.6).
 # Cross-checked by validators/: tcf_reader.py (annex + native accept/reject,
 # foreign bridging), go_gate.py / perfetto_gate.py / pprof_gate.py /
 # ctef_gate.py (native emit). Compiled with kaitai-struct-compiler 0.11 (python, java,

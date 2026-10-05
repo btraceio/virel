@@ -16,6 +16,7 @@ CLI:
   virel_container.py collect OUT FORMAT:PATH [FORMAT:PATH ...]   (FORMAT = format id)
   virel_container.py ls FILE
   virel_container.py extract FILE STREAM_ID OUT
+  virel_container.py finalize VIRL [OUT]     (in place without OUT; spec §3.9.6)
 """
 import os, struct, sys
 
@@ -478,6 +479,59 @@ def split_chunks(data):
         p += size
     return out
 
+# ---------------- VIRL finalization (spec §3.9.6) ----------------
+FINAL_CHUNK = 0x02            # native header low flags byte @67, bit 1
+STREAMING = 0x04              # bit 2
+
+def _finalize_plan(data):
+    """[(chunk offset, size, last snapshot, set_final)] for the complete streaming chunks"""
+    from tcf_reader import chunk_extent, is_streaming_header, walk_streaming_chunk
+    plan, p, chunks = [], 0, []
+    while p < len(data):
+        if is_streaming_header(data, p):
+            n, complete, last = walk_streaming_chunk(data, p)
+            if complete:
+                plan.append([p, n, last, False])
+        else:
+            n, complete = chunk_extent(data, p)
+        chunks.append((p, n, complete))
+        p += n
+    # FINAL-CHUNK marks a cleanly ended stream: every chunk complete, and the last one is
+    # finalized by this call (an already-finalized last chunk is left untouched).
+    if plan and chunks and all(c[2] for c in chunks) and plan[-1][0] == chunks[-1][0]:
+        plan[-1][3] = True
+    return plan
+
+def _header_patches(data, entry):
+    """(offset, bytes) writes for one chunk, in the order a finalizer MUST apply them:
+    posthoc fields first, the flags byte (STREAMING cleared) last"""
+    p, n, last, final = entry
+    flags = (data[p + 67] & ~STREAMING) | (FINAL_CHUNK if final else 0)
+    return [(p + 8, struct.pack(">Q", n)), (p + 16, struct.pack(">Q", last)), (p + 67, bytes([flags]))]
+
+def finalize_virl(data):
+    """finalize every complete streaming chunk of a VIRL stream; returns (bytes, chunks finalized).
+    Only header posthoc fields change: size, last state snapshot offset, flags (STREAMING
+    cleared; FINAL-CHUNK on the last chunk of a cleanly ended stream). Duration stays 0
+    (unknown). Event bytes never change; incomplete chunks stay streaming; idempotent."""
+    out = bytearray(data)
+    plan = _finalize_plan(data)
+    for entry in plan:
+        for off, b in _header_patches(data, entry):
+            out[off:off + len(b)] = b
+    return bytes(out), len(plan)
+
+def finalize_virl_file(path):
+    """in-place finalization on a seekable file, chunk by chunk, flags byte last per chunk"""
+    data = open(path, "rb").read()
+    plan = _finalize_plan(data)
+    with open(path, "r+b") as f:
+        for entry in plan:
+            for off, b in _header_patches(data, entry):
+                f.seek(off); f.write(b)
+            f.flush()
+    return len(plan)
+
 def sniff(data):
     """file kind from the leading bytes (spec §3.8): 'virc', 'virl', or a convenience format"""
     if data[:8] == SIGNATURE:
@@ -613,6 +667,14 @@ def _main(argv):
             fmt, path = spec.split(":", 1)
             inputs.append((fmt, open(path, "rb").read(), [("source", os.path.abspath(path))]))
         collect(argv[1], inputs)
+        return 0
+    if len(argv) in (2, 3) and argv[0] == "finalize":
+        if len(argv) == 2:
+            print(f"finalized {finalize_virl_file(argv[1])} chunk(s) in place")
+        else:
+            out, n = finalize_virl(open(argv[1], "rb").read())
+            open(argv[2], "wb").write(out)
+            print(f"finalized {n} chunk(s) -> {argv[2]}")
         return 0
     if len(argv) == 2 and argv[0] == "ls":
         r = ContainerReader(open(argv[1], "rb").read())

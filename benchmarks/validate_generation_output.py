@@ -62,7 +62,7 @@ def validate(path, row):
         chunk = data[pos:pos+size]
         if (len(chunk) != size or size < 76 or chunk[:4] != b'VIRL' or
             struct.unpack_from('>HH', chunk, 4) != (0, 1) or chunk[64] != 0 or
-            (not streaming and chunk[66:68] != b'\x80\x01') or metadata != 76):
+            (not streaming and chunk[66:68] not in (b'\x80\x01', b'\x80\x03' if pos + size == len(data) else b'\x80\x01')) or metadata != 76):
             raise RuntimeError('native finalized header')
         if not streaming and not 76 <= last_snapshot < size:
             raise RuntimeError('last snapshot offset')

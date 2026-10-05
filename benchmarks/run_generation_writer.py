@@ -10,8 +10,14 @@ import platform
 import random
 import statistics
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from validate_generation_output import validate
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'validators'))
+from tcf_reader import chunk_extent
+from virel_container import finalize_virl_file
 
 ROOT = Path(__file__).resolve().parent
 MODES = ('fixed', 'generation', 'staged')
@@ -74,6 +80,21 @@ SIGNAL_SCENARIOS = {
     't64-d512-rotation': {'producers': 64, 'signal-hz': 1000, 'stacks': 1024, 'stack-depth': 512, 'rotate-us': 100000},
 }
 SIGNAL_MODES = ('stage', 'global', 'hybrid')
+# VIRL streaming chunks (spec §3.9.6) versus finalized chunks, with real output: a
+# finalized writer rewrites each chunk header in place on every publication (a seek
+# and a 76-byte write on a file); a streaming writer never seeks, so it can also
+# write into a FIFO. All runs use the generation writer mode.
+STREAMING_SCENARIOS = {
+    # many small chunks: one header rewrite per publication and per rotation
+    'p4-handle-rot1ms': {'producers': 4, 'workload': 'handle', 'rotate-us': 1000},
+    # paced producers with age-limited prefix drains: many publications per chunk
+    'p4-lookup-drain1ms': {'producers': 4, 'workload': 'lookup', 'rate': 10000,
+                           'drain-age-us': 1000, 'rotate-us': 100000},
+    # events plus SIGPROF stack samples (512 frames) at 16 threads
+    'p16-signal-d512': {'producers': 16, 'workload': 'lookup', 'rate': 5000, 'drain-age-us': 1000,
+                        'signal-hz': 1000, 'stack-depth': 512, 'stacks': 1024, 'rotate-us': 10000},
+}
+STREAMING_MODES = ('finalized-file', 'streaming-file', 'streaming-fifo')
 
 
 def run(binary, mode, options, events, verify=False):
@@ -101,6 +122,56 @@ def run(binary, mode, options, events, verify=False):
     if row['signal_hz'] and (not row['handler_entries'] or not row['samples_committed']):
         raise RuntimeError('signal samples not exercised')
     return row
+
+
+def run_to_sink(binary, options, events, sink, directory, verify=False):
+    """run the generation writer with real output; sink = finalized-file | streaming-file |
+    streaming-fifo. Returns (row, output path)."""
+    out = Path(directory) / f'{sink}.virl'
+    opts = dict(options, output=out)
+    if sink.startswith('streaming'):
+        opts['streaming'] = 1
+    if sink != 'streaming-fifo':
+        return run(binary, 'generation', opts, events, verify), out
+    fifo = Path(directory) / 'sink.fifo'
+    if fifo.exists():
+        fifo.unlink()
+    os.mkfifo(fifo)
+    target = Path(directory) / 'fifo-capture.virl'
+    def drain():
+        with open(fifo, 'rb') as src, open(target, 'wb') as dst:
+            while True:
+                block = src.read(1 << 16)
+                if not block:
+                    return
+                dst.write(block)
+    t = threading.Thread(target=drain)
+    t.start()
+    try:
+        row = run(binary, 'generation', dict(opts, output=fifo), events, verify)
+    finally:
+        t.join(timeout=60)
+    return row, target
+
+
+def index_cost(path):
+    """reader-side cost of finding chunk boundaries (spec §3.9, §3.9.6): best of three
+    full passes of tcf_reader.chunk_extent; finalized chunks are skipped by their size
+    field, streaming chunks are walked event by event to END_OF_PARTITION"""
+    data = path.read_bytes()
+    best, count = None, 0
+    for _ in range(3):
+        t0 = time.perf_counter_ns()
+        p = count = 0
+        while p < len(data):
+            n, complete = chunk_extent(data, p)
+            if not complete:
+                raise RuntimeError('incomplete chunk in a closed output')
+            p += n
+            count += 1
+        dt = time.perf_counter_ns() - t0
+        best = dt if best is None else min(best, dt)
+    return count, best, len(data)
 
 
 def report(rows):
@@ -187,13 +258,61 @@ def signal_report(rows):
     return '\n'.join(lines)+'\n'
 
 
+def streaming_report(rows):
+    lines = ['# VIRL streaming chunks versus finalized chunks', '',
+             'Generation writer with real output; medians [min–max] over repeats. Finalized rewrites',
+             'each chunk header in place per publication (seek + 76 B write); streaming writes every',
+             'header once and never seeks, so it also runs into a FIFO drained by the runner.',
+             'Header rewrites = header publications. Index µs/chunk = reader-side best-of-3',
+             'Python tcf_reader.chunk_extent pass (finalized: size field; streaming: event walk',
+             'to END_OF_PARTITION); it is a relative figure, not an optimized reader.',
+             'Finalize µs/chunk = in-place finalization of the streaming output (one event walk',
+             'plus header writes, Python); Index after = the same index pass on the finalized file.', '',
+             '| Scenario | Sink | CPU ns/committed [range] | Call p99 ns [range] | Header rewrites | Bytes/committed | Chunks | Index µs/chunk [range] | Finalize µs/chunk | Index after finalize µs/chunk | Loss % max |',
+             '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+    for scenario in STREAMING_SCENARIOS:
+        for sink in STREAMING_MODES:
+            group = [r for r in rows if r['scenario'] == scenario and r['sink'] == sink]
+            if not group:
+                continue
+            def med(key):
+                return statistics.median(r[key] for r in group)
+            def dist(key, scale=1, digits=0):
+                vs = [r[key]/scale for r in group]
+                return f'{statistics.median(vs):.{digits}f} [{min(vs):.{digits}f}–{max(vs):.{digits}f}]'
+            loss = max(100*(r['dropped']+r['discarded_after_acceptance'])/(r['events']*r['producers']) for r in group)
+            wire = statistics.median(r['wire_bytes']/r['committed'] for r in group if r['committed'])
+            fin = f"{med('finalize_ns_per_chunk')/1000:.1f}" if 'finalize_ns_per_chunk' in group[0] else '—'
+            after = f"{med('index_finalized_ns_per_chunk')/1000:.1f}" if 'index_finalized_ns_per_chunk' in group[0] else '—'
+            lines.append(f"| {scenario} | {sink} | {dist('cpu_ns_per_committed')} | {dist('producer_p99_ns')} | "
+                         f"{med('header_publications'):.0f} | {wire:.2f} | {med('chunks'):.0f} | "
+                         f"{dist('index_ns_per_chunk', 1000, 1)} | {fin} | {after} | {loss:.3f} |")
+    lines += ['', 'Overhead relative to finalized-file (median of medians):', '']
+    for scenario in STREAMING_SCENARIOS:
+        base = [r for r in rows if r['scenario'] == scenario and r['sink'] == 'finalized-file']
+        if not base:
+            continue
+        b_cpu = statistics.median(r['cpu_ns_per_committed'] for r in base)
+        b_idx = statistics.median(r['index_ns_per_chunk'] for r in base)
+        for sink in STREAMING_MODES[1:]:
+            group = [r for r in rows if r['scenario'] == scenario and r['sink'] == sink]
+            if group:
+                cpu = statistics.median(r['cpu_ns_per_committed'] for r in group)
+                idx = statistics.median(r['index_ns_per_chunk'] for r in group)
+                after = statistics.median(r['index_finalized_ns_per_chunk'] for r in group)
+                lines.append(f"- {scenario} {sink}: writer CPU/committed {100*(cpu-b_cpu)/b_cpu:+.1f}%, "
+                             f"reader index cost per chunk x{idx/b_idx:.0f} streaming, "
+                             f"x{after/b_idx:.1f} after finalization")
+    return '\n'.join(lines)+'\n'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--events', type=int, default=100000)
     parser.add_argument('--repeats', type=int, default=5)
     parser.add_argument('--compiler', default=os.environ.get('CXX', 'clang++'))
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--suite', choices=('native', 'publication', 'signal'), default='native')
+    parser.add_argument('--suite', choices=('native', 'publication', 'signal', 'streaming'), default='native')
     args = parser.parse_args()
     if not 10000 <= args.events <= 10000000 or args.repeats < 1:
         parser.error('events must be 10000..10000000; repeats positive')
@@ -241,6 +360,29 @@ def main():
                 verification.append(row)
             scenarios, modes, render = PUBLICATION_SCENARIOS, PUBLICATION_MODES, publication_report
             scenario_options = lambda name: dict(PUBLICATION_BASE, **PUBLICATION_SCENARIOS[name])
+        elif args.suite == 'streaming':
+            # Correctness first: the verified native, publication and signal cases with streaming
+            # chunks, to a file and once through a FIFO; every output independently validated.
+            cases = []
+            for workload in ('handle', 'lookup', 'miss'):
+                cases.append({'workload': workload, 'producers': 4, 'rotate-us': 500})
+            cases.append({'workload': 'miss', 'drop-buffer-every': 7})
+            for fault in ('stall-ms', 'pause-ms'):
+                cases.append({'producers': 4, 'rotate-us': 500, fault: 50})
+            cases.append(dict(PUBLICATION_BASE, workload='miss', **BURSTY, **{'drain-age-us': 100, 'rotate-us': 500}))
+            cases.append(dict(SIGNAL_BASE, workload='miss', **{'producers': 4, 'signal-hz': 5000, 'stack-depth': 1024,
+                                                               'rotate-us': 500, 'drain-age-us': 100}))
+            for i, opts in enumerate(cases):
+                opts = {k: v for k, v in opts.items() if k != 'observe-publication'}
+                sink = 'streaming-fifo' if i == len(cases) - 1 else 'streaming-file'
+                row, out = run_to_sink(binary, opts, 10000 if 'pause-ms' not in opts and 'stall-ms' not in opts else 20000,
+                                       sink, directory, verify=True)
+                if not row['streaming'] or row['header_publications']:
+                    raise RuntimeError('streaming run rewrote a header')
+                native_checks.append(validate(out, row))
+                verification.append(dict(row, sink=sink))
+            scenarios, modes, render = STREAMING_SCENARIOS, STREAMING_MODES, streaming_report
+            scenario_options = lambda name: STREAMING_SCENARIOS[name]
         elif args.suite == 'signal':
             for stack_mode in SIGNAL_MODES:
                 base = dict(SIGNAL_BASE, workload='miss', **{'stack-mode': stack_mode})
@@ -293,10 +435,30 @@ def main():
         random.Random(20261004).shuffle(jobs)
         for index, (repeat, name, mode) in enumerate(jobs):
             print(f'{index+1}/{len(jobs)}: {name} {mode} repeat {repeat+1}', flush=True)
-            row = run(binary, *run_mode(mode, name), args.events)
+            if args.suite == 'streaming':
+                row, out = run_to_sink(binary, scenario_options(name), args.events, mode, directory)
+                count, index_ns, size = index_cost(out)
+                if count != row['chunks'] or size != row['wire_bytes']:
+                    raise RuntimeError('streaming measurement output accounting')
+                if mode.startswith('streaming') and row['header_publications']:
+                    raise RuntimeError('streaming run rewrote a header')
+                row.update(sink=mode, index_ns_per_chunk=index_ns / count)
+                if mode.startswith('streaming'):
+                    # Finalization for distribution (spec §3.9.6): in place, then index again.
+                    t0 = time.perf_counter_ns()
+                    finalized = finalize_virl_file(out)
+                    finalize_ns = time.perf_counter_ns() - t0
+                    count2, index2_ns, _ = index_cost(out)
+                    if finalized != count or count2 != count:
+                        raise RuntimeError('finalization accounting')
+                    row.update(finalize_ns_per_chunk=finalize_ns / count,
+                               index_finalized_ns_per_chunk=index2_ns / count)
+                out.unlink()
+            else:
+                row = run(binary, *run_mode(mode, name), args.events)
             row.update(scenario=name, repeat=repeat)
             rows.append(row)
-    mode_key = 'stack_mode' if args.suite == 'signal' else 'mode'
+    mode_key = {'signal': 'stack_mode', 'streaming': 'sink'}.get(args.suite, 'mode')
     rows.sort(key=lambda r:(list(scenarios).index(r['scenario']),modes.index(r[mode_key]),r['repeat']))
     output = {'recorded_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
               'platform':platform.platform(),'logical_cpus':os.cpu_count(),'compiler':compiler,

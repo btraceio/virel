@@ -14,8 +14,13 @@ stack samples and 20 ms generation rotation, built into a work directory.
   4 concat   finalized + streaming + finalized concatenated: one valid VIRL stream
   5 virc     streaming VIRL packed into VIRC one chunk per record, VIRC itself written to a FIFO
              (container streaming profile: CLOSED records only); extraction byte-exact; sniffing
-  6 kaitai   the generated parser walks streaming chunks to END_OF_PARTITION (skipped without
-             KSC/kaitaistruct)
+  6 final    finalization: every complete streaming chunk gets size + last snapshot, STREAMING
+             cleared last, FINAL-CHUNK on the last chunk; only those header bytes change;
+             idempotent; in place == copy; validates as finalized output; a truncated file keeps
+             its incomplete tail streaming; a mid-finalization header (size set, flag still set)
+             reads correctly
+  7 kaitai   the generated parser walks streaming chunks to END_OF_PARTITION and sizes finalized
+             ones (skipped without KSC/kaitaistruct)
 """
 import contextlib, io, json, os, shutil, subprocess, sys, tempfile, threading
 
@@ -157,7 +162,44 @@ def main():
           (vc.sniff(got["data"]), vc.sniff(sdata), vc.sniff(fdata), vc.sniff(b"FLR\0..."), vc.sniff(b"go 1.26 trace\0\0\0"))
           == ("virc", "virl", "virl", "jfr", "go-trace"))
 
-    print("6 kaitai")
+    print("6 final")
+    fin, nfin = vc.finalize_virl(sdata)
+    starts = [p for p, _, _ in chunks_of(sdata)]
+    allowed = set()
+    for p in starts:
+        allowed.update(range(p + 8, p + 24)); allowed.add(p + 67)
+    changed = [i for i in range(len(sdata)) if sdata[i] != fin[i]]
+    check(f"finalize: {nfin} chunks; {len(changed)} changed bytes, all in header size/last-snapshot/flags",
+          nfin == stream_row["chunks"] and changed and set(changed) <= allowed and len(fin) == len(sdata))
+    heads = [(int.from_bytes(fin[p + 8:p + 16], "big"), fin[p + 67]) for p in starts]
+    check("finalize: every header finalized (size > 0, STREAMING clear), FINAL-CHUNK only on the last",
+          all(sz > 0 and not fl & 0x04 for sz, fl in heads)
+          and [bool(fl & 0x02) for _, fl in heads] == [False] * (len(heads) - 1) + [True])
+    again, n2 = vc.finalize_virl(fin)
+    inplace = os.path.join(WORK, "inplace.virl")
+    open(inplace, "wb").write(sdata)
+    vc.finalize_virl_file(inplace)
+    check("finalize: idempotent, and in place == copy", again == fin and n2 == 0 and open(inplace, "rb").read() == fin)
+    try:
+        res = validate(inplace, dict(stream_row, streaming=False))
+        check(f"finalize: output validates as finalized ({res['chunks']} chunks)", True)
+    except Exception as e:
+        check("finalize: output validates as finalized", False, repr(e))
+    cut = starts[len(starts) // 2] + 500
+    tf, tn = vc.finalize_virl(sdata[:cut])
+    tparts = chunks_of(tf)
+    check(f"finalize truncated file: {tn} complete chunks finalized, incomplete tail stays streaming, no FINAL-CHUNK",
+          tn == len(starts) // 2 and tparts[-1][2] is False and tf[tparts[-1][0] + 67] & 0x04
+          and not any(tf[p + 67] & 0x02 for p, _, _ in tparts))
+    mid = bytearray(sdata)
+    p0, n0, _ = chunks_of(sdata)[0]
+    mid[p0 + 8:p0 + 16] = n0.to_bytes(8, "big")           # size written, STREAMING not yet cleared
+    check("mid-finalization header (size set, flag still set): extent from size, same chunk",
+          chunk_extent(bytes(mid), p0) == (n0, True))
+    rd = read_quiet(fin + sdata)
+    check("finalized + streaming concatenation parses", rd.chunks == 2 * stream_row["chunks"] and not rd.foreign_spans)
+
+    print("7 kaitai")
     ksc = os.environ.get("KSC") or shutil.which("kaitai-struct-compiler")
     try:
         import kaitaistruct
@@ -181,6 +223,9 @@ def main():
         check(f"kaitai: concatenation parses ({len(sizes)} chunks, {sum(1 for _, s_ in sizes if s_)} streaming walked "
               f"to END_OF_PARTITION)", len(sizes) == n and streaming_ok
               and sum(1 for _, s_ in sizes if s_) == stream_row["chunks"])
+        kf = TcfFraming.ChunkStream(KaitaiStream(io.BytesIO(fin)))
+        check("kaitai: finalized chunks are sized (no event walk)",
+              len(kf.chunks) == stream_row["chunks"] and not any(ch.header.is_streaming for ch in kf.chunks))
         k2 = TcfFraming.from_bytes(got["data"])
         check("kaitai: the VIRC container parses with the VIRC signature", len(k2.records) == len(cr.records))
 
