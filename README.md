@@ -44,12 +44,3 @@ fixtures. `validators/fixtures/make_fixtures.sh` regenerates those fixtures,
 except the real Chrome trace used by gate 5 (see AGENTS.md). Existing gate
 results establish representation/fidelity, not native recording performance.
 Historical `tcf` filenames remain to preserve links and imports.
-
-## Origin
-
-Extracted on 2026-10-04 from `.investigations/jfr-spec` in an OpenJDK checkout at
-commit `b22ccb9af5fc7d097f5bf24e0e87a1c02c5810dd`.
-Evidence nodes citing `src/hotspot/...` or `src/jdk.jfr/...` refer to that
-[OpenJDK source tree](https://github.com/openjdk/jdk/tree/b22ccb9af5fc7d097f5bf24e0e87a1c02c5810dd),
-not files in this repository. Historical `.investigations/jfr-spec/` paths now
-resolve relative to this repository's root. No OpenJDK source tree is copied.
