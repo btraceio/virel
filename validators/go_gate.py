@@ -220,7 +220,9 @@ def validate(g):
     if not g["eog"]: errs.append("missing EndOfGeneration")
     for sid, frames in g["stacks"].items():
         for (pc, fid, flid, line) in frames:
-            if fid not in g["strings"] or flid not in g["strings"]:
+            # string id 0 = "no string": Go's dataTable.get returns the zero value for it
+            # (internal/trace/base.go:163-166); real traces emit all-zero frames
+            if (fid and fid not in g["strings"]) or (flid and flid not in g["strings"]):
                 errs.append(f"stack {sid} references unknown string")
     return errs
 
@@ -776,7 +778,8 @@ def verify(data, gens, container, Reader):
             fr_ok = pool_ok
             if pool_ok:
                 for sid, frames in g["stacks"].items():
-                    want = [(pc, g["strings"][fid], g["strings"][flid], line)
+                    # Go string id 0 ("no string") is VIREL pool key 0 (null)
+                    want = [(pc, g["strings"][fid] if fid else None, g["strings"][flid] if flid else None, line)
                             for (pc, fid, flid, line) in frames]
                     if _frames(stpool.get(sid)) != want:
                         fr_ok = False
