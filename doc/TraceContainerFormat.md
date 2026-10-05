@@ -634,8 +634,13 @@ a seekable medium or on a copy.
   before and after. Finalization is idempotent. An incomplete trailing chunk
   stays streaming, so files with streaming and finalized chunks mixed are
   valid.
-- A writer that can seek MAY finalize each chunk itself when it closes it.
-  That yields the same header as live finalized writing (§3.9.3).
+- **Finalize-on-close**: a streaming writer that can seek MAY finalize each
+  chunk itself when it closes it, with the same field order. It may also fill
+  in the duration, which it knows. A live reader then walks only the open
+  chunk, and the closed file needs no separate finalization pass. If the sink
+  turns out not to be seekable, the chunk simply stays streaming. Unlike live
+  finalized writing (§3.9.3), this costs one header write per chunk, not one
+  per publication.
 
 ---
 

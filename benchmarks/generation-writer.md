@@ -546,47 +546,74 @@ The suite has two parts.
 
 ### Results
 
-[45 runs](../evidence/generation-writer-streaming.md),
+[60 runs](../evidence/generation-writer-streaming.md),
 [raw JSON](../evidence/generation-writer-streaming.json),
-[source](../evidence/generation-streaming-source.cpp). Validation covered 8
-verified streaming runs, one through a FIFO: 1,219 chunks, 368,203 events and
-39,639 samples.
+[source](../evidence/generation-streaming-source.cpp). Validation covered 11
+verified streaming runs: three to a file with finalize-on-close, one through a
+FIFO and one finalize-on-close run through a FIFO. Together: 1,602 chunks,
+488,203 events and 79,788 samples.
 
-- **Header rewrites:** finalized output rewrote headers 1,524–18,870 times per
-  run; streaming rewrote none.
-- **Writer CPU per committed event:** no consistent overhead. Medians ranged
-  from −35% (many 1 ms chunks to a file) to +12% (16 threads with samples into
-  a FIFO). Every streaming range overlaps the finalized range. An earlier
-  recording on the same host gave −0.6% to −25%, so run-to-run noise on this
-  host exceeds any streaming effect.
-- **Producer call p99:** no systematic difference; ranges overlap.
-- **Bytes per committed event:** the same within run-to-run timing noise.
-  Streaming adds no bytes: the header is the same size and END_OF_PARTITION
-  was already written.
+There are four outputs. `streaming-foc-file` is streaming with
+`--finalize-on-close 1`: each chunk is finalized by the writer when it closes.
+
+**Host load caveat:** other workloads were running during this recording (load
+average 14.1 before, 8.4 after, on 12 logical CPUs). Two earlier recordings on
+a quieter host showed the same pattern for everything below except writer CPU.
+
+- **Header writes:**
+  - finalized output: 1,524–18,747 in-place rewrites per run, one per
+    publication;
+  - finalize-on-close: exactly one per chunk (20–314);
+  - streaming: none.
+- **Writer CPU per committed event:** not distinguishable. Medians moved from
+  −15% to +53% relative to finalized, in both directions and across outputs,
+  with heavily overlapping ranges. The earlier quieter recordings gave −35%
+  to +12%. The defensible conclusion is that no output shows a consistent
+  writer cost.
+- **Bytes per committed event:** the same within run-to-run noise. No output
+  adds bytes.
 - **Loss:** none in any run.
-- **Reader cost to find chunk boundaries:**
-  - A finalized chunk is skipped by its size field: ~0.6 µs per chunk in
-    Python, whatever the chunk size.
-  - A streaming chunk must be walked event by event to END_OF_PARTITION:
-    0.5–9 ms per chunk here, ×800 to ×16,000. That is pure Python; a native
-    reader is far faster, but it stays O(events).
-  - This matters only for skipping and random access. A sequential reader
-    decodes every event anyway.
+- **Reader cost to find chunk boundaries** (Python, best of three):
+
+  | Output | µs per chunk |
+  |---|---:|
+  | Finalized | 0.6–0.8 |
+  | Finalize-on-close | 0.8–1.0 |
+  | Streaming | 690–13,500 |
+  | Streaming, after offline finalization | 0.6–0.9 |
+
+  Skipping a streaming chunk walks every event; a native reader is far
+  faster, but still O(events).
 
 ### Finalization
 
 Finalization (spec §3.9.6) patches only the posthoc header fields, clears
-STREAMING last, and leaves event bytes unchanged. Streaming output therefore
-serves live transport and is finalized once for distribution:
+STREAMING last, and leaves event bytes unchanged. There are two ways to do it:
 
-- **Cost:** one event walk per chunk plus three small header writes. In place,
-  in Python, that is 2.4–3.0 µs per event (0.6–10 ms per chunk), about the
-  cost of a single streaming index pass.
-- **After finalization:** the same index pass costs 0.6–0.9 µs per chunk
-  (×0.9–1.3 of natively finalized output). Fast skips come back.
-- **Correctness (GATE 7 step 6):**
+- **Offline** (`virel_container.py finalize`), for streaming output produced
+  where seeking is impossible. It costs one event walk per chunk plus three
+  small header writes: in place, in Python, 2.4–3.6 µs per event across the
+  recordings, about the cost of one streaming index pass. Afterwards, index
+  cost is back to finalized level.
+- **In the writer** (`--streaming 1 --finalize-on-close 1`):
+  - one seek and two small writes per closed chunk; posthoc fields first,
+    flags byte last;
+  - the duration is filled in, and FINAL-CHUNK is set on the last chunk;
+  - live readers walk only the open chunk, and the closed file is already
+    finalized;
+  - on a pipe or FIFO the seek fails, the chunk stays streaming, and the
+    writer counts it (`finalize_skipped`).
+
+**Correctness:**
+- GATE 7 step 6 (offline):
   - only header size, last-snapshot and flags bytes change;
-  - running it twice changes nothing; in place equals a copy;
+  - it is idempotent, and in place equals a copy;
   - the result validates as finalized output;
   - an incomplete tail stays streaming;
   - a header seen mid-finalization reads correctly.
+- GATE 7 step 7 (finalize-on-close):
+  - to a file, every chunk is finalized with duration set and FINAL-CHUNK
+    only on the last, and the output validates as finalized;
+  - through a FIFO, every chunk stays streaming;
+  - live views of a running writer never show size 0 with STREAMING clear.
+- ASan/UBSan: 0 reports on file and FIFO runs.

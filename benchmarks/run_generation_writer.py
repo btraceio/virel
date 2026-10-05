@@ -94,7 +94,9 @@ STREAMING_SCENARIOS = {
     'p16-signal-d512': {'producers': 16, 'workload': 'lookup', 'rate': 5000, 'drain-age-us': 1000,
                         'signal-hz': 1000, 'stack-depth': 512, 'stacks': 1024, 'rotate-us': 10000},
 }
-STREAMING_MODES = ('finalized-file', 'streaming-file', 'streaming-fifo')
+# streaming-foc-file: streaming chunks finalized by the writer as each closes (one seek per
+# chunk instead of one per publication), so a live reader walks only the open chunk.
+STREAMING_MODES = ('finalized-file', 'streaming-file', 'streaming-fifo', 'streaming-foc-file')
 
 
 def run(binary, mode, options, events, verify=False):
@@ -126,12 +128,14 @@ def run(binary, mode, options, events, verify=False):
 
 def run_to_sink(binary, options, events, sink, directory, verify=False):
     """run the generation writer with real output; sink = finalized-file | streaming-file |
-    streaming-fifo. Returns (row, output path)."""
+    streaming-fifo | streaming-foc-file | streaming-foc-fifo. Returns (row, output path)."""
     out = Path(directory) / f'{sink}.virl'
     opts = dict(options, output=out)
     if sink.startswith('streaming'):
         opts['streaming'] = 1
-    if sink != 'streaming-fifo':
+    if sink.startswith('streaming-foc'):
+        opts['finalize-on-close'] = 1
+    if not sink.endswith('fifo'):
         return run(binary, 'generation', opts, events, verify), out
     fifo = Path(directory) / 'sink.fifo'
     if fifo.exists():
@@ -263,12 +267,13 @@ def streaming_report(rows):
              'Generation writer with real output; medians [min–max] over repeats. Finalized rewrites',
              'each chunk header in place per publication (seek + 76 B write); streaming writes every',
              'header once and never seeks, so it also runs into a FIFO drained by the runner.',
-             'Header rewrites = header publications. Index µs/chunk = reader-side best-of-3',
+             'Header writes = in-place header rewrites (finalized: per publication; streaming-foc:',
+             'one per closed chunk, finalize-on-close). Index µs/chunk = reader-side best-of-3',
              'Python tcf_reader.chunk_extent pass (finalized: size field; streaming: event walk',
              'to END_OF_PARTITION); it is a relative figure, not an optimized reader.',
              'Finalize µs/chunk = in-place finalization of the streaming output (one event walk',
              'plus header writes, Python); Index after = the same index pass on the finalized file.', '',
-             '| Scenario | Sink | CPU ns/committed [range] | Call p99 ns [range] | Header rewrites | Bytes/committed | Chunks | Index µs/chunk [range] | Finalize µs/chunk | Index after finalize µs/chunk | Loss % max |',
+             '| Scenario | Sink | CPU ns/committed [range] | Call p99 ns [range] | Header writes | Bytes/committed | Chunks | Index µs/chunk [range] | Finalize µs/chunk | Index after finalize µs/chunk | Loss % max |',
              '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for scenario in STREAMING_SCENARIOS:
         for sink in STREAMING_MODES:
@@ -285,7 +290,7 @@ def streaming_report(rows):
             fin = f"{med('finalize_ns_per_chunk')/1000:.1f}" if 'finalize_ns_per_chunk' in group[0] else '—'
             after = f"{med('index_finalized_ns_per_chunk')/1000:.1f}" if 'index_finalized_ns_per_chunk' in group[0] else '—'
             lines.append(f"| {scenario} | {sink} | {dist('cpu_ns_per_committed')} | {dist('producer_p99_ns')} | "
-                         f"{med('header_publications'):.0f} | {wire:.2f} | {med('chunks'):.0f} | "
+                         f"{med('header_writes'):.0f} | {wire:.2f} | {med('chunks'):.0f} | "
                          f"{dist('index_ns_per_chunk', 1000, 1)} | {fin} | {after} | {loss:.3f} |")
     lines += ['', 'Overhead relative to finalized-file (median of medians):', '']
     for scenario in STREAMING_SCENARIOS:
@@ -299,6 +304,10 @@ def streaming_report(rows):
             if group:
                 cpu = statistics.median(r['cpu_ns_per_committed'] for r in group)
                 idx = statistics.median(r['index_ns_per_chunk'] for r in group)
+                if sink == 'streaming-foc-file':
+                    lines.append(f"- {scenario} {sink}: writer CPU/committed {100*(cpu-b_cpu)/b_cpu:+.1f}%, "
+                                 f"reader index cost per chunk x{idx/b_idx:.1f} (finalized by the writer at close)")
+                    continue
                 after = statistics.median(r['index_finalized_ns_per_chunk'] for r in group)
                 lines.append(f"- {scenario} {sink}: writer CPU/committed {100*(cpu-b_cpu)/b_cpu:+.1f}%, "
                              f"reader index cost per chunk x{idx/b_idx:.0f} streaming, "
@@ -321,6 +330,7 @@ def main():
     metadata_sha = hashlib.sha256((ROOT / 'generation_metadata.inc').read_bytes()).hexdigest()
     runner_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     rows, verification = [], []
+    load_before = os.getloadavg()
     native_checks = []
     with tempfile.TemporaryDirectory(prefix='virel-generation-') as directory:
         binary = Path(directory) / 'generation_writer'
@@ -372,14 +382,22 @@ def main():
             cases.append(dict(PUBLICATION_BASE, workload='miss', **BURSTY, **{'drain-age-us': 100, 'rotate-us': 500}))
             cases.append(dict(SIGNAL_BASE, workload='miss', **{'producers': 4, 'signal-hz': 5000, 'stack-depth': 1024,
                                                                'rotate-us': 500, 'drain-age-us': 100}))
-            for i, opts in enumerate(cases):
+            sinks = ['streaming-file'] * (len(cases) - 1) + ['streaming-fifo']
+            # finalize-on-close: to a file every chunk ends finalized; through a FIFO every
+            # chunk stays streaming (the seek fails and is counted)
+            cases += [cases[0], cases[-1], cases[0]]
+            sinks += ['streaming-foc-file', 'streaming-foc-file', 'streaming-foc-fifo']
+            for opts, sink in zip(cases, sinks):
                 opts = {k: v for k, v in opts.items() if k != 'observe-publication'}
-                sink = 'streaming-fifo' if i == len(cases) - 1 else 'streaming-file'
                 row, out = run_to_sink(binary, opts, 10000 if 'pause-ms' not in opts and 'stall-ms' not in opts else 20000,
                                        sink, directory, verify=True)
                 if not row['streaming'] or row['header_publications']:
-                    raise RuntimeError('streaming run rewrote a header')
-                native_checks.append(validate(out, row))
+                    raise RuntimeError('streaming run rewrote a header per publication')
+                if sink == 'streaming-foc-file' and (row['finalized_chunks'] != row['chunks'] or row['finalize_skipped']):
+                    raise RuntimeError('finalize-on-close did not finalize every chunk')
+                if sink == 'streaming-foc-fifo' and (row['finalized_chunks'] or row['finalize_skipped'] != row['chunks']):
+                    raise RuntimeError('finalize-on-close through a FIFO must keep chunks streaming')
+                native_checks.append(validate(out, dict(row, streaming=sink != 'streaming-foc-file')))
                 verification.append(dict(row, sink=sink))
             scenarios, modes, render = STREAMING_SCENARIOS, STREAMING_MODES, streaming_report
             scenario_options = lambda name: STREAMING_SCENARIOS[name]
@@ -441,9 +459,12 @@ def main():
                 if count != row['chunks'] or size != row['wire_bytes']:
                     raise RuntimeError('streaming measurement output accounting')
                 if mode.startswith('streaming') and row['header_publications']:
-                    raise RuntimeError('streaming run rewrote a header')
-                row.update(sink=mode, index_ns_per_chunk=index_ns / count)
-                if mode.startswith('streaming'):
+                    raise RuntimeError('streaming run rewrote a header per publication')
+                if mode == 'streaming-foc-file' and row['finalized_chunks'] != count:
+                    raise RuntimeError('finalize-on-close did not finalize every chunk')
+                row.update(sink=mode, index_ns_per_chunk=index_ns / count,
+                           header_writes=row['header_publications'] + row.get('finalized_chunks', 0))
+                if mode in ('streaming-file', 'streaming-fifo'):
                     # Finalization for distribution (spec §3.9.6): in place, then index again.
                     t0 = time.perf_counter_ns()
                     finalized = finalize_virl_file(out)
@@ -464,6 +485,7 @@ def main():
               'platform':platform.platform(),'logical_cpus':os.cpu_count(),'compiler':compiler,
               'source_sha256':source_sha,'metadata_sha256':metadata_sha,
               'runner_sha256':runner_sha,'suite':args.suite,
+              'load_average_before':load_before,'load_average_after':os.getloadavg(),
               'build_flags':flags,'events':args.events,'repeats':args.repeats,'shuffle_seed':20261004,
               'verification_rows':verification,'native_output_checks':native_checks,'rows':rows}
     args.output.parent.mkdir(parents=True,exist_ok=True)

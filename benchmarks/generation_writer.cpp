@@ -93,6 +93,7 @@ struct Config {
     std::string stack_mode="global", stack_sharing="shared"; // accepted design: S3, two nesting levels
     bool observe_publication=false;
     bool streaming=false; // VIRL streaming chunks (spec §3.9.6): header written once, never patched
+    bool finalize_on_close=false; // with streaming: finalize each chunk's header when it closes, if the sink can seek
     bool verify=false;
     std::string output;
 };
@@ -359,6 +360,7 @@ struct Lane {
 struct Sink {
     std::array<uint8_t,65536> bytes{}; size_t cursor=0;
     uint64_t wire_bytes=0,checksum=0,events=0,definitions=0,chunks=0,publications=0;
+    uint64_t finalized=0,finalize_skipped=0;
     FILE* file=nullptr;
     std::array<std::array<std::atomic<uint8_t>,76>,2> published{};
     ~Sink(){if(file)std::fclose(file);}
@@ -370,6 +372,20 @@ struct Sink {
             auto end=ftello(file);
             if(fseeko(file,off_t(g.file_offset),SEEK_SET)||std::fwrite(g.header.data(),1,76,file)!=76||fseeko(file,end,SEEK_SET))throw std::runtime_error("header write");
         }
+    }
+    // Finalize-on-close (spec §3.9.6): one seek back per closed chunk. Posthoc fields
+    // (bytes 8..63) first, then the flags byte with STREAMING cleared, so a concurrent
+    // reader never sees size 0 with STREAMING clear. A sink that cannot seek (pipe, FIFO)
+    // keeps the chunk streaming; that is counted, not an error.
+    bool finalize(const std::array<uint8_t,76>& header,uint64_t file_offset) {
+        if(!file){++finalize_skipped;return false;}
+        if(std::fflush(file))throw std::runtime_error("output flush");
+        const auto end=ftello(file);
+        if(end<0||fseeko(file,off_t(file_offset+8),SEEK_SET)) {std::clearerr(file);++finalize_skipped;return false;}
+        if(std::fwrite(header.data()+8,1,56,file)!=56||std::fflush(file)||
+           fseeko(file,off_t(file_offset+67),SEEK_SET)||std::fwrite(header.data()+67,1,1,file)!=1||
+           std::fflush(file)||fseeko(file,end,SEEK_SET))throw std::runtime_error("finalize write");
+        ++finalized;return true;
     }
     void write(const uint8_t* p,size_t n) {
         // Memory sink: a ring standing in for consumed output; writes larger
@@ -528,6 +544,7 @@ int main(int argc,char** argv) try {
         else if(a=="--flush-clock")c.flush_clock=n;
         else if(a=="--observe-publication")c.observe_publication=n!=0;
         else if(a=="--streaming")c.streaming=n!=0;
+        else if(a=="--finalize-on-close")c.finalize_on_close=n!=0;
         else if(a=="--visibility-every")c.visibility_every=n;
         else if(a=="--burst")c.burst=n;
         else if(a=="--drain-age-us")c.drain_age_us=n;
@@ -553,7 +570,7 @@ int main(int argc,char** argv) try {
        (c.inject_every&&!c.nodefer)||c.inject_every>1000000||(c.stack_mode!="stage"&&c.stack_mode!="global"&&c.stack_mode!="hybrid")||
        !c.stack_capacity||c.stack_capacity>65536||c.frame_capacity<MAX_DEPTH||c.frame_capacity>(1u<<24)||
        c.lane_kib<16||c.lane_kib>1024||
-       (c.stack_sharing!="shared"&&c.stack_sharing!="disjoint")||c.rotate_us>10000000||(c.mode=="fixed"&&c.rotate_us))throw std::runtime_error("invalid configuration");
+       (c.stack_sharing!="shared"&&c.stack_sharing!="disjoint")||c.rotate_us>10000000||(c.mode=="fixed"&&c.rotate_us)||(c.finalize_on_close&&!c.streaming))throw std::runtime_error("invalid configuration");
     std::vector<Value> values(c.cardinality);
     for(size_t i=0;i<values.size();++i) {
         uint64_t x=i+1;
@@ -773,9 +790,17 @@ int main(int argc,char** argv) try {
             data[0]=uint8_t(n&127)|128;data[1]=uint8_t((n>>7)&127)|128;data[2]=uint8_t(n>>14);
             g.last_snapshot=g.body_bytes;sink.write(data.data(),n);g.body_bytes+=n;
         };
-        auto close=[&](Generation& g) {
+        auto close=[&](Generation& g,bool last=false) {
             snapshot(g,0,nullptr,true); // exact output-committed events; eos follows
             uint8_t eos[]={128|3,0,8};sink.write(eos,3);g.body_bytes+=3;
+            if(c.streaming&&c.finalize_on_close) {
+                big_endian(g.header.data()+8,g.body_bytes);
+                big_endian(g.header.data()+16,g.last_snapshot);
+                big_endian(g.header.data()+40,now_ns()-g.anchor);
+                g.header[67]=uint8_t((g.header[67]&~4)|(last?2:0)); // STREAMING cleared; FINAL-CHUNK on the last
+                if(!sink.finalize(g.header,g.file_offset)) // stays streaming: restore the written header
+                    {big_endian(g.header.data()+8,0);big_endian(g.header.data()+16,0);big_endian(g.header.data()+40,0);g.header[67]=1|4;}
+            }
             publish(g,true);g.open=false;
         };
         // Producer-buffer record helpers for unsealed prefixes: the reference
@@ -1058,7 +1083,7 @@ int main(int argc,char** argv) try {
                 }
                 if(all_done&&!pinned(emitting)&&emitting==active.load()) {
                     if(defer_start)max_defer_ns=std::max(max_defer_ns,now-defer_start);
-                    close(*generations[emitting%2]);break;}
+                    close(*generations[emitting%2],true);break;}
                 if(!progress)std::this_thread::sleep_for(std::chrono::microseconds(20));
             }
         }catch(...){consumer_error=std::current_exception();}
@@ -1118,7 +1143,8 @@ int main(int argc,char** argv) try {
     std::cout<<"{\"mode\":\""<<c.mode<<"\",\"workload\":\""<<c.workload<<"\",\"verify\":"<<(c.verify?"true":"false")
         <<",\"producers\":"<<c.producers<<",\"events\":"<<c.events<<",\"cardinality\":"<<c.cardinality<<",\"capacity\":"<<c.capacity
         <<",\"flush_us\":"<<c.flush_us<<",\"flush_clock\":"<<c.flush_clock<<",\"burst\":"<<c.burst
-        <<",\"streaming\":"<<(c.streaming?"true":"false")<<",\"observe_publication\":"<<(c.observe_publication?"true":"false")<<",\"visibility_every\":"<<c.visibility_every
+        <<",\"streaming\":"<<(c.streaming?"true":"false")<<",\"finalize_on_close\":"<<(c.finalize_on_close?"true":"false")
+        <<",\"finalized_chunks\":"<<sink.finalized<<",\"finalize_skipped\":"<<sink.finalize_skipped<<",\"observe_publication\":"<<(c.observe_publication?"true":"false")<<",\"visibility_every\":"<<c.visibility_every
         <<",\"drain_age_us\":"<<c.drain_age_us<<",\"partial_drains\":"<<partial_drains
         <<",\"periodic_flushes\":"<<periodic_flushes<<",\"publication_samples\":"<<publication_latency.size()
         <<",\"publication_discarded_samples\":"<<discarded_capture_samples

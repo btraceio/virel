@@ -19,10 +19,14 @@ stack samples and 20 ms generation rotation, built into a work directory.
              idempotent; in place == copy; validates as finalized output; a truncated file keeps
              its incomplete tail streaming; a mid-finalization header (size set, flag still set)
              reads correctly
-  7 kaitai   the generated parser walks streaming chunks to END_OF_PARTITION and sizes finalized
+  7 foc      writer finalize-on-close: to a file every chunk is finalized at close (size,
+             last snapshot, duration, FINAL-CHUNK on the last) and validates as finalized output;
+             through a FIFO every chunk stays streaming; live views of a running writer only ever
+             show finalized or streaming headers, never size 0 with STREAMING clear
+  8 kaitai   the generated parser walks streaming chunks to END_OF_PARTITION and sizes finalized
              ones (skipped without KSC/kaitaistruct)
 """
-import contextlib, io, json, os, shutil, subprocess, sys, tempfile, threading
+import contextlib, io, json, os, shutil, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -199,7 +203,69 @@ def main():
     rd = read_quiet(fin + sdata)
     check("finalized + streaming concatenation parses", rd.chunks == 2 * stream_row["chunks"] and not rd.foreign_spans)
 
-    print("7 kaitai")
+    print("7 foc")
+    foc_path = os.path.join(WORK, "foc.virl")
+    r = subprocess.run([exe] + ARGS + ["--streaming", "1", "--finalize-on-close", "1", "--output", foc_path],
+                       capture_output=True, text=True, timeout=120)
+    foc_row = json.loads(r.stdout)
+    fd = open(foc_path, "rb").read()
+    fparts = chunks_of(fd)
+    fheads = [(int.from_bytes(fd[p + 8:p + 16], "big"), fd[p + 67], int.from_bytes(fd[p + 40:p + 48], "big"))
+              for p, _, _ in fparts]
+    check(f"foc file: {foc_row['finalized_chunks']} of {foc_row['chunks']} chunks finalized at close, 0 per-publication rewrites",
+          foc_row["finalized_chunks"] == foc_row["chunks"] == len(fparts) and not foc_row["finalize_skipped"]
+          and not foc_row["header_publications"])
+    check("foc file: every header sized, STREAMING clear, duration set, FINAL-CHUNK only on the last",
+          all(sz > 0 and not fl & 0x04 and du > 0 for sz, fl, du in fheads)
+          and [bool(fl & 0x02) for _, fl, _ in fheads] == [False] * (len(fheads) - 1) + [True])
+    try:
+        validate(foc_path, dict(foc_row, streaming=False))
+        check("foc file: validates as finalized output", True)
+    except Exception as e:
+        check("foc file: validates as finalized output", False, repr(e))
+    rc3, out3, err3 = through_fifo([exe] + ARGS + ["--streaming", "1", "--finalize-on-close", "1"],
+                                   os.path.join(WORK, "foc-fifo.virl"))
+    foc_fifo = json.loads(out3) if rc3 == 0 else {}
+    ffd = open(os.path.join(WORK, "foc-fifo.virl"), "rb").read()
+    check("foc FIFO: the seek fails, every chunk stays streaming (counted, not an error)",
+          rc3 == 0 and foc_fifo["finalize_skipped"] == foc_fifo["chunks"] and not foc_fifo["finalized_chunks"]
+          and all(ffd[p + 67] & 0x04 for p, _, _ in chunks_of(ffd)), err3[-200:])
+    rbad = subprocess.run([exe, "--mode", "generation", "--events", "1000", "--finalize-on-close", "1"],
+                          capture_output=True, text=True)
+    check("foc without --streaming is rejected", rbad.returncode != 0 and "invalid configuration" in rbad.stderr)
+    live_path = os.path.join(WORK, "foc-live.virl")
+    proc = subprocess.Popen([exe, "--mode", "generation", "--events", "6000", "--producers", "2", "--rate", "3000",
+                             "--rotate-us", "50000", "--streaming", "1", "--finalize-on-close", "1",
+                             "--output", live_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    views, invalid, crashes, mixed, open_tail = 0, 0, 0, 0, 0
+    while proc.poll() is None:
+        time.sleep(0.05)
+        if not os.path.exists(live_path):
+            continue
+        view = open(live_path, "rb").read()
+        if len(view) < 76:
+            continue
+        views += 1
+        try:
+            parts = chunks_of(view)
+        except Exception:
+            crashes += 1; continue
+        for p, _len, ok_ in parts:
+            size = int.from_bytes(view[p + 8:p + 16], "big") if p + 16 <= len(view) else None
+            if size == 0 and p + 68 <= len(view) and not view[p + 67] & 0x04:
+                invalid += 1                     # size 0 with STREAMING clear must never be visible
+        fin_n = sum(1 for p, _len, ok_ in parts if ok_ and not view[p + 67] & 0x04)
+        if fin_n and proc.poll() is None:
+            mixed += 1                           # chunks already finalized while the writer still runs
+            open_tail += 0 if parts[-1][2] else 1   # an open streaming chunk was visible too (timing-dependent)
+    proc.communicate()
+    # Gated: no view ever shows size 0 with STREAMING clear, and finalized chunks appear while the
+    # writer runs. Whether a view also catches a half-written tail depends on stdio flush timing.
+    check(f"foc live: {views} views of a running writer, {mixed} with chunks finalized mid-run "
+          f"({open_tail} also with an open streaming tail); no invalid header state, no crash",
+          views > 5 and mixed > 0 and not invalid and not crashes, f"invalid={invalid} crashes={crashes}")
+
+    print("8 kaitai")
     ksc = os.environ.get("KSC") or shutil.which("kaitai-struct-compiler")
     try:
         import kaitaistruct
