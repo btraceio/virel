@@ -40,11 +40,11 @@ header = {
         {"name": "magic", "type": "bytes", "doc": "FLR\\0 for the JFR annex; VIRL for native chunks"},
         {"name": "major", "type": "int"},
         {"name": "minor", "type": "int"},
-        {"name": "chunkSize", "type": "long", "doc": "back-patched at finalize (padded varint in the wire; annex initial = 68)"},
+        {"name": "chunkSize", "type": "long", "doc": "back-patched at finalize (annex initial = 68); 0 in a native streaming chunk (flags @67 bit 2 STREAMING), whose extent ends at its END_OF_PARTITION event (type id 8)"},
         {"name": "stateSnapshotOffset", "type": "long", "doc": "chunk-relative; JFR annex = LAST checkpoint, native = LAST state snapshot; delta walks backward; 0 = none"},
         {"name": "metadataOffset", "type": "long", "doc": "chunk-relative; MAY move mid-chunk"},
         {"name": "startNanos", "type": "long", "doc": "UTC ns; written at open; stable"},
-        {"name": "durationNanos", "type": "long", "doc": "posthoc at finalize; 0 while live"},
+        {"name": "durationNanos", "type": "long", "doc": "posthoc at finalize; 0 while live and in streaming chunks"},
         {"name": "startTicks", "type": "long", "doc": "anchor: annex event ticks ABSOLUTE (FastUnordered, non-monotonic by design); native event ticks CHUNK-RELATIVE, per-writer non-decreasing"},
         {"name": "ticksPerSecond", "type": "long"},
         {"name": "state", "type": "int", "doc": "0 = COMPLETE, 255 = UPDATING"},
@@ -129,7 +129,7 @@ event = {
 # ---------------- container layer (spec §3, format-agnostic; numerics PROPOSED 2026-10-04) ----------------
 container_header = {
     "type": "record", "name": "ContainerHeader",
-    "doc": "32-byte container header (spec §3.2): signature \\x89VRL\\r\\n\\x1a\\n, major/minor, header size, flags, container id, CRC-32C as the last 4 header bytes. Readers reject unknown majors; minors are additive.",
+    "doc": "32-byte container header (spec §3.2): signature VIRC\\r\\n\\x1a\\n, major/minor, header size, flags, container id, CRC-32C as the last 4 header bytes. Readers reject unknown majors; minors are additive.",
     "fields": [
         {"name": "major", "type": "int", "doc": "0 = draft"},
         {"name": "minor", "type": "int"},
@@ -363,7 +363,7 @@ container = {
         {"name": "streams", "type": {"type": "array", "items": stream}},
         {"name": "manifest", "type": ["null", "virel.model.Manifest"], "default": None},
         {"name": "cleanlyClosed", "type": "boolean", "doc": "valid END record present"},
-        {"name": "implicit", "type": "boolean", "default": False, "doc": "opened from a bare legacy file as an implicit one-stream container (spec §3.8)"},
+        {"name": "implicit", "type": "boolean", "default": False, "doc": "opened from a VIRL file (or a bare legacy file) as an implicit one-stream container (spec §3.8)"},
         {"name": "damagedSpans", "type": {"type": "array", "items": "virel.model.DamagedSpan"}, "default": []}
     ]
 }

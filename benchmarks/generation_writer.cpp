@@ -92,6 +92,7 @@ struct Config {
     uint64_t stack_capacity=4096, frame_capacity=1<<21, lane_kib=64;
     std::string stack_mode="global", stack_sharing="shared"; // accepted design: S3, two nesting levels
     bool observe_publication=false;
+    bool streaming=false; // VIRL streaming chunks (spec §3.9.6): header written once, never patched
     bool verify=false;
     std::string output;
 };
@@ -526,6 +527,7 @@ int main(int argc,char** argv) try {
         else if(a=="--flush-us")c.flush_us=n;
         else if(a=="--flush-clock")c.flush_clock=n;
         else if(a=="--observe-publication")c.observe_publication=n!=0;
+        else if(a=="--streaming")c.streaming=n!=0;
         else if(a=="--visibility-every")c.visibility_every=n;
         else if(a=="--burst")c.burst=n;
         else if(a=="--drain-age-us")c.drain_age_us=n;
@@ -597,7 +599,8 @@ int main(int argc,char** argv) try {
     }
     uint64_t start=0;
     Sink sink;
-    if(!c.output.empty()) {sink.file=std::fopen(c.output.c_str(),"wb+");if(!sink.file)throw std::runtime_error("open output");}
+    // Streaming output never seeks, so it may be a pipe or FIFO; finalized output back-patches headers.
+    if(!c.output.empty()) {sink.file=std::fopen(c.output.c_str(),c.streaming?"wb":"wb+");if(!sink.file)throw std::runtime_error("open output");}
     const auto epoch_now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     const auto epoch_ticks=now_ns();
     uint64_t rotations=0,rotation_deferred=0,max_live=1,max_queued=0,negative_offsets=0;
@@ -720,6 +723,9 @@ int main(int argc,char** argv) try {
         std::vector<uint64_t> previous(c.producers,NO_GENERATION);
         std::array<uint8_t,256> output{};
         auto publish=[&](Generation& g,bool complete=false) {
+            // Streaming chunks keep their first header: extent comes from the END_OF_PARTITION
+            // event, summaries from in-band state snapshots.
+            if(c.streaming)return;
             big_endian(g.header.data()+8,g.body_bytes);
             big_endian(g.header.data()+16,g.last_snapshot);
             big_endian(g.header.data()+40,now_ns()-g.anchor);
@@ -735,6 +741,7 @@ int main(int argc,char** argv) try {
             big_endian(g.header.data()+48,g.anchor);big_endian(g.header.data()+56,1000000000);
             big_endian(g.header.data()+68,0x564952454c42454eULL); // one logical writer
             g.header[64]=1;g.header[66]=128;g.header[67]=1;
+            if(c.streaming) {big_endian(g.header.data()+8,0);big_endian(g.header.data()+24,76);g.header[64]=0;g.header[67]=1|4;}
             g.file_offset=sink.wire_bytes;sink.write(g.header.data(),76);
             const auto* schema=signals?SAMPLE_METADATA:NATIVE_METADATA;
             const size_t schema_size=signals?sizeof(SAMPLE_METADATA):sizeof(NATIVE_METADATA);
@@ -1111,7 +1118,7 @@ int main(int argc,char** argv) try {
     std::cout<<"{\"mode\":\""<<c.mode<<"\",\"workload\":\""<<c.workload<<"\",\"verify\":"<<(c.verify?"true":"false")
         <<",\"producers\":"<<c.producers<<",\"events\":"<<c.events<<",\"cardinality\":"<<c.cardinality<<",\"capacity\":"<<c.capacity
         <<",\"flush_us\":"<<c.flush_us<<",\"flush_clock\":"<<c.flush_clock<<",\"burst\":"<<c.burst
-        <<",\"observe_publication\":"<<(c.observe_publication?"true":"false")<<",\"visibility_every\":"<<c.visibility_every
+        <<",\"streaming\":"<<(c.streaming?"true":"false")<<",\"observe_publication\":"<<(c.observe_publication?"true":"false")<<",\"visibility_every\":"<<c.visibility_every
         <<",\"drain_age_us\":"<<c.drain_age_us<<",\"partial_drains\":"<<partial_drains
         <<",\"periodic_flushes\":"<<periodic_flushes<<",\"publication_samples\":"<<publication_latency.size()
         <<",\"publication_discarded_samples\":"<<discarded_capture_samples

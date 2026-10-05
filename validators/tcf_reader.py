@@ -18,12 +18,44 @@ from collections import defaultdict
 MAGIC_ANNEX = b"FLR\x00"          # JFR annex magic (ChunkHeader.java:43)
 MAGIC_NATIVE = b"VIRL"             # VIREL native chunk magic
 MAGICS = (MAGIC_ANNEX, MAGIC_NATIVE)
+FLAG_STREAMING = 0x04              # native header low flags byte @67, bit 2 (spec §3.9.6)
+TYPE_END_OF_PARTITION = 8          # m0 registered END_OF_PARTITION (spec §4.4)
 
 class ModelComposite(dict):
     """composite value that REMEMBERS its named-field model form"""
     __slots__ = ("model_fields",)
     def __init__(self, out, fl):
         super().__init__(out); self.model_fields = fl
+
+# ---------- chunk extent (spec §3.9, §3.9.6) ----------
+
+def chunk_extent(d, pos):
+    """(length, complete) of the chunk starting at pos.
+    A finalized chunk declares its size at offset 8. A streaming chunk (native, size 0,
+    STREAMING flag) is never back-patched: it extends through its END_OF_PARTITION event,
+    found by walking size-prefixed events. A streaming chunk cut before its terminator runs
+    to the end of the data and is incomplete."""
+    if pos + 76 > len(d):
+        return len(d) - pos, False
+    size = struct.unpack_from(">Q", d, pos + 8)[0]
+    if size:
+        return min(size, len(d) - pos), pos + size <= len(d)
+    if d[pos:pos + 4] != MAGIC_NATIVE or not d[pos + 67] & FLAG_STREAMING:
+        return len(d) - pos, False
+    p = pos + 76
+    try:
+        while p < len(d):
+            cur = Cursor(d, p)
+            n = cur.varint()
+            if n <= 0 or p + n > len(d):
+                break
+            tid = cur.varint()
+            p += n
+            if tid == TYPE_END_OF_PARTITION:
+                return p - pos, True
+    except (IOError, IndexError):
+        pass
+    return len(d) - pos, False
 
 # ---------- cursor ----------
 
@@ -362,7 +394,9 @@ class Reader:
                 self.foreign_spans.append((pos, nm)); pos = nm; continue
             kind, hdr_size, major, minor = c
             cur = Cursor(data, pos)
-            size = struct.unpack_from(">q", data, pos + 8)[0]
+            size = size_field = struct.unpack_from(">q", data, pos + 8)[0]
+            if size == 0:                       # streaming chunk: extent = walk to END_OF_PARTITION
+                size, _complete = chunk_extent(data, pos)
             meta_off = struct.unpack_from(">q", data, pos + 24)[0]
             flags = struct.unpack_from(">H", data, pos + 66)[0]
             start_nanos = struct.unpack_from(">q", data, pos + 32)[0]
@@ -407,7 +441,7 @@ class Reader:
                         {"index": len(self.chunk_models), "class": kind.upper() if kind != "native" else "NATIVE",
                          "major": major, "minor": minor,
                          "header": {"magic": data[pos:pos+4], "major": major, "minor": minor,
-                                    "chunkSize": size, "stateSnapshotOffset": meta_off and struct.unpack_from(">q", data, pos + 16)[0] or 0,
+                                    "chunkSize": size_field, "stateSnapshotOffset": meta_off and struct.unpack_from(">q", data, pos + 16)[0] or 0,
                                     "metadataOffset": meta_off, "startNanos": start_nanos,
                                     "durationNanos": dur_nanos, "startTicks": start_ticks,
                                     "ticksPerSecond": tps, "state": struct.unpack_from(">B", data, pos + 64)[0],

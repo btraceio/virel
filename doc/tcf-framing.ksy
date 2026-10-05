@@ -1,8 +1,10 @@
 # VIREL framing — Kaitai Struct (normative for the byte layer)
-# Two layers (spec §3):
-#   - the format-agnostic container: header + records (top level of this file);
-#   - the `virel`/`jfr` chunk-stream payload formats (type `chunk_stream`),
-#     parsed from a stream reconstructed by concatenating its DATA payloads.
+# Two file kinds (spec §3.1), two layers:
+#   - VIRC, the format-agnostic container: header + records (top level of this file);
+#   - VIRL, the native event stream, and the `virel`/`jfr` chunk-stream payloads: type
+#     `chunk_stream`, for a VIRL file or a stream reconstructed from its DATA payloads.
+#     Streaming chunks (size 0, STREAMING flag) are walked event by event to
+#     END_OF_PARTITION (spec §3.9.6).
 # Cross-checked by validators/: tcf_reader.py (annex + native accept/reject,
 # foreign bridging), go_gate.py / perfetto_gate.py / pprof_gate.py /
 # ctef_gate.py (native emit). Compiled with kaitai-struct-compiler 0.11 (python, java,
@@ -28,7 +30,7 @@ types:
   container_header:
     seq:
       - id: signature
-        contents: [0x89, 0x56, 0x52, 0x4c, 0x0d, 0x0a, 0x1a, 0x0a]   # "\x89VRL\r\n\x1a\n"
+        contents: [0x56, 0x49, 0x52, 0x43, 0x0d, 0x0a, 0x1a, 0x0a]   # "VIRC\r\n\x1a\n"
       - id: major
         type: u2            # 0 = draft; readers reject unknown majors
       - id: minor
@@ -189,6 +191,21 @@ types:
         type: tcf_header
       - id: body
         size: 'header.is_native ? header.chunk_size - 76 : header.chunk_size - 68'
+        if: header.chunk_size != 0
+      - id: events
+        type: event
+        repeat: until
+        repeat-until: _.type_id.value == 8     # END_OF_PARTITION terminates a streaming chunk
+        if: header.chunk_size == 0
+  event:
+    # [size: padded varint, includes its own width][typeId: varint][body]
+    seq:
+      - id: size_
+        type: varint
+      - id: type_id
+        type: varint
+      - id: body
+        size: size_.value - size_.groups.size - type_id.groups.size
   tcf_header:
     seq:
       - id: magic
@@ -222,6 +239,7 @@ types:
         type: u2            # @66: bit15 = VIREL-SIGNATURE (set = native VIRL; always clear
                             # in the JFR 1/2 FLR annex, spec §3.9.5). LOW byte @67 = final-chunk flag.
                             # HIGH byte bits 0..6 = default metadata-encoding id, 0..127.
+                            # LOW byte @67 bit 2 = STREAMING (native: header never patched, size 0).
       - id: writer_id
         type: u8            # RANDOM per chunk writer, != 0 (native 76-byte header only)
         if: is_native
@@ -230,6 +248,8 @@ types:
         value: (flags_word & 0x8000) != 0
       is_native:
         value: magic == 0x5649524c and signature_set
+      is_streaming:
+        value: is_native and (flags_word & 0x0004) != 0 and chunk_size == 0
 enums:
   record_kind:
     0: pad

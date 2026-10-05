@@ -112,7 +112,7 @@
                   "type": {
                     "type": "record",
                     "name": "ContainerHeader",
-                    "doc": "32-byte container header (spec §3.2): signature \\x89VRL\\r\\n\\x1a\\n, major/minor, header size, flags, container id, CRC-32C as the last 4 header bytes. Readers reject unknown majors; minors are additive.",
+                    "doc": "32-byte container header (spec §3.2): signature VIRC\\r\\n\\x1a\\n, major/minor, header size, flags, container id, CRC-32C as the last 4 header bytes. Readers reject unknown majors; minors are additive.",
                     "fields": [
                       {
                         "name": "major",
@@ -556,7 +556,7 @@
                       {
                         "name": "chunkSize",
                         "type": "long",
-                        "doc": "back-patched at finalize (padded varint in the wire; annex initial = 68)"
+                        "doc": "back-patched at finalize (annex initial = 68); 0 in a native streaming chunk (flags @67 bit 2 STREAMING), whose extent ends at its END_OF_PARTITION event (type id 8)"
                       },
                       {
                         "name": "stateSnapshotOffset",
@@ -576,7 +576,7 @@
                       {
                         "name": "durationNanos",
                         "type": "long",
-                        "doc": "posthoc at finalize; 0 while live"
+                        "doc": "posthoc at finalize; 0 while live and in streaming chunks"
                       },
                       {
                         "name": "startTicks",
@@ -1204,7 +1204,7 @@
       "name": "implicit",
       "type": "boolean",
       "default": false,
-      "doc": "opened from a bare legacy file as an implicit one-stream container (spec §3.8)"
+      "doc": "opened from a VIRL file (or a bare legacy file) as an implicit one-stream container (spec §3.8)"
     },
     {
       "name": "damagedSpans",

@@ -8,7 +8,7 @@ import struct
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'validators'))
-from tcf_reader import Cursor, Reader
+from tcf_reader import Cursor, Reader, chunk_extent
 
 EVENT_TYPE = 1 << 30
 SAMPLE_TYPE = EVENT_TYPE + 1
@@ -48,14 +48,23 @@ def validate(path, row):
     pos = chunks = events = definitions = negatives = samples = stacks = methods = 0
     previous, sample_previous = {}, {}
     values = [fixture(i) for i in range(row['cardinality'])]
+    streaming = row.get('streaming', False)
     while pos < len(data):
         size, last_snapshot, metadata = struct.unpack_from('>QQQ', data, pos + 8)
+        if streaming:
+            # Streaming chunk (spec §3.9.6): header written once, never patched; the extent
+            # ends at END_OF_PARTITION and summaries are found in-band only.
+            if size != 0 or last_snapshot != 0 or data[pos + 64] != 0 or data[pos + 66:pos + 68] != b'\x80\x05':
+                raise RuntimeError('native streaming header')
+            size, complete = chunk_extent(data, pos)
+            if not complete:
+                raise RuntimeError('streaming chunk without END_OF_PARTITION')
         chunk = data[pos:pos+size]
         if (len(chunk) != size or size < 76 or chunk[:4] != b'VIRL' or
             struct.unpack_from('>HH', chunk, 4) != (0, 1) or chunk[64] != 0 or
-            chunk[66:68] != b'\x80\x01' or metadata != 76):
+            (not streaming and chunk[66:68] != b'\x80\x01') or metadata != 76):
             raise RuntimeError('native finalized header')
-        if not 76 <= last_snapshot < size:
+        if not streaming and not 76 <= last_snapshot < size:
             raise RuntimeError('last snapshot offset')
         reader = Reader()
         reader.record = True
@@ -134,7 +143,7 @@ def validate(path, row):
                     summary = [(cursor.varint(), cursor.varint()) for _ in range(entries)]
                     expected = ([(EVENT_TYPE, event_count)] if event_count else []) + \
                                ([(SAMPLE_TYPE, sample_events)] if sample_events else [])
-                    if version != 1 or summary != expected or offset != last_snapshot:
+                    if version != 1 or summary != expected or (not streaming and offset != last_snapshot):
                         raise RuntimeError('committed-prefix summary')
                     final_summary = offset
                 # Definition order: a method before any stack using it, a stack
@@ -175,7 +184,7 @@ def validate(path, row):
             elif tid != 0:
                 raise RuntimeError('undeclared unexpected type')
             cursor.pos = end
-        if (previous_snapshot != last_snapshot or final_summary is None or event_count != count
+        if ((not streaming and previous_snapshot != last_snapshot) or final_summary is None or event_count != count
                 or sample_events != sample_count):
             raise RuntimeError('summary discoverability')
         samples += sample_count

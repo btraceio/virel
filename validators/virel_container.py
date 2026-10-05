@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""virel_container.py — reference implementation of the VIREL container (spec §3, draft 0.1).
+"""virel_container.py — reference implementation of the VIRC container (spec §3, draft 0.1).
+
+VIREL has two file kinds (spec §3.1): a VIRL file is one native event stream (§3.9; written
+directly by a native producer, concatenable, streamable); a VIRC file is this container of
+framed streams of any format. sniff() tells them apart from the leading bytes.
 
 Format-agnostic: the container never parses payload bytes. Splitters below only find
 record boundaries (spec §3.4.3, informative) and never change the bytes.
@@ -15,7 +19,8 @@ CLI:
 """
 import os, struct, sys
 
-SIGNATURE = b"\x89VRL\r\n\x1a\n"
+SIGNATURE = b"VIRC\r\n\x1a\n"          # VIRC container (spec §3.2)
+VIRL_MAGIC = b"VIRL"                    # native event stream / chunk magic (spec §3.9)
 CONTAINER_HEADER = 32
 REC_MAGIC = b"VREC"
 REC_HEADER = 56
@@ -459,17 +464,31 @@ def _leb(d, p):
         sh += 7
 
 def split_chunks(data):
-    """virel / jfr: one chunk per record; RESYNC on every chunk; time range from the chunk header"""
+    """virel / jfr: one chunk per record; RESYNC on every chunk; time range from the chunk header.
+    Streaming VIRL chunks (size 0) end at their END_OF_PARTITION event (spec §3.9.6)."""
+    from tcf_reader import chunk_extent
     out, p = [], 0
     while p < len(data):
-        size = struct.unpack_from(">Q", data, p + 8)[0] if p + 48 <= len(data) else 0
-        if size < 68 or p + size > len(data):
+        size, complete = chunk_extent(data, p)
+        if not complete or size < 68:
             out.append((data[p:], 0, 0, 0))   # not splittable further: rest as one record
             break
         start, dur = struct.unpack_from(">QQ", data, p + 32)
         out.append((data[p:p + size], F_RESYNC, start, start + dur if dur else 0))
         p += size
     return out
+
+def sniff(data):
+    """file kind from the leading bytes (spec §3.8): 'virc', 'virl', or a convenience format"""
+    if data[:8] == SIGNATURE:
+        return "virc"
+    if data[:4] == VIRL_MAGIC:
+        return "virl"
+    if data[:4] == b"FLR\0":
+        return "jfr"
+    if data[:5] == b"go 1.":
+        return "go-trace"
+    return None
 
 def split_go_trace(data):
     """16-byte header (PREAMBLE), then one record per generation (RESYNC). Format 1.26 ends a

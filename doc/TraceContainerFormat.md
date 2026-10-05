@@ -1,5 +1,5 @@
 # VIREL — Versioned In-band Runtime Event Ledger
-### Specification draft v0.1 · container major 0 · native payload major 0 · JFR payload majors 1/2 (frozen) · 2026-10-04
+### Specification draft v0.1 · VIRL native major 0 · VIRC container major 0 · JFR payload majors 1/2 (frozen) · 2026-10-05
 
 > **Status:** DRAFT. VIREL is the selected protocol name. Native chunks use
 > magic `VIRL` and wire type namespaces `virel.*`, `virel2.*`, and
@@ -10,10 +10,12 @@
 > this draft and are now RATIFIED by proceed (2026-10-03); all other content
 > is decided. Corrections from the validator run are folded in as of
 > 2026-10-03 (see ev-validator-jfr-annex).
-> **2026-10-04:** every VIREL file is a format-agnostic container of framed
-> streams (§3). Native VIREL and JFR are payload formats on equal footing with
-> Go trace, Perfetto and others [find-agnostic-container]. Container numerics
-> are PROPOSED.
+> **2026-10-04/05:** VIREL has two file kinds (§3.1). A **VIRL** file is one
+> native event stream: self-sufficient, concatenable, and streamable on
+> non-seekable sinks (§3.9.6). A **VIRC** file is a format-agnostic container
+> of framed streams, where native VIREL and JFR are payload formats on equal
+> footing with Go trace, Perfetto and OTLP [find-agnostic-container,
+> find-container-split]. Container and streaming numerics are PROPOSED.
 
 ---
 
@@ -28,11 +30,12 @@
 1. **Superset**: one format represents JFR (`.jfr`), Go execution trace v2,
    and Perfetto (TracePacket) as **sub-configurations** [find-superset-goal,
    find-coverage-matrix].
-2. **Agnostic container**: the container (§3) frames streams of any format
-   (native VIREL, JFR, Go trace, Perfetto, OTLP traces and logs) identically
-   and never
-   interprets payloads [find-agnostic-container]. A conforming reader MUST
-   decode `virel` streams. Decoding any other format is OPTIONAL and supported
+2. **Two file kinds**: a VIRL file is one self-sufficient, concatenable,
+   streamable native event stream (§3.9); the VIRC container (§3) frames
+   streams of any format (native VIREL, JFR, Go trace, Perfetto, OTLP traces
+   and logs) identically and never interprets payloads
+   [find-agnostic-container, find-container-split]. A conforming reader MUST
+   read VIRL files and `virel` streams. Decoding any other format is OPTIONAL and supported
    through payload decoders (plugins) (§3.1). JFR-annex chunks share the
    native chunk grammar (§3.9), so a `jfr` decoder is cheap to provide, but it
    is not mandatory [find-subset-direction, superseded in part].
@@ -79,7 +82,9 @@ anchors, §8).
 - Pool reference = `u32` key into the type's constant pool; **0 = null**.
 - Floating point = IEEE 754 binary32/binary64, BE.
 - The following terms are normative:
-  - *container*: a VIREL file, i.e. a header plus records (§3);
+  - *VIRL file*: one native event stream, a concatenation of native chunks
+    (§3.9);
+  - *container* (*VIRC file*): a container header plus records (§3);
   - *record*: one framed unit of a container (§3.3);
   - *stream*: the byte stream of one payload format inside a container,
     reconstructed byte-exactly from its DATA records (§3.1);
@@ -90,19 +95,31 @@ anchors, §8).
 
 ---
 
-## 3. Container (format-agnostic)
+## 3. File kinds: VIRL native streams and the VIRC container
 
-> Decided 2026-10-04 [find-agnostic-container]. Container numerics in this
-> section (signature, record layout, kinds, descriptor keys, format ids) are
-> PROPOSED and not yet ratified. The former §3.1–§3.5 (chunk headers, chunk
-> live-write, chunk recovery, foreign-chunk bridging) are now §3.9.1–§3.9.5
-> and apply only inside chunk-stream payloads.
+> Decided 2026-10-04 [find-agnostic-container]; split into two file kinds
+> with a streaming mode 2026-10-05 [find-container-split]. Numerics in this
+> section (container signature, record layout, kinds, descriptor keys, format
+> ids, the STREAMING flag) are PROPOSED and not yet ratified. The former
+> §3.1–§3.5 (chunk headers, chunk live-write, chunk recovery, foreign-chunk
+> bridging) are now §3.9.1–§3.9.5. They define the VIRL file and the
+> `virel`/`jfr` chunk-stream payloads.
 
 ### 3.1 Model
 
-- **Every VIREL file is a container**: a container header (§3.2) followed by
-  records (§3.3). This includes a file written live by one native profiler,
-  which is a container with a single `virel` stream.
+- **Two file kinds**, told apart by their leading bytes (§3.8):
+  - **VIRL** (§3.9): one native event stream, a concatenation of native
+    chunks starting with `VIRL`. A native producer writes it directly, as a
+    JVM writes `.jfr`. It needs no container. VIRL files concatenate:
+    `cat a.virl b.virl` is a valid VIRL file (§3.9). With streaming chunks
+    (§3.9.6) a VIRL file is written without ever seeking, so it works on
+    pipes, sockets and append-only storage.
+  - **VIRC** (§3.2–§3.7): a container header followed by records (§3.3),
+    holding streams of any payload format. It is for composite recordings
+    (a collector packing JFR, VIRL, a Go trace, …) and archives. A VIRL file
+    goes into VIRC unchanged as a `virel` stream.
+  Single-provenance data SHOULD be VIRL. VIRC adds identity, integrity and
+  indexing across sources; it is not required for one source.
 - A **stream** is a byte stream in one payload format (§3.4). Native VIREL,
   JFR, Go trace, Perfetto, OTLP and every other format are framed the same
   way. The container MUST NOT treat any format specially, and it never parses
@@ -117,14 +134,16 @@ anchors, §8).
   such as OTLP export requests. Writers SHOULD split at the format's
   natural resync unit so the time index and recovery work per unit: one chunk
   per record for `virel` and `jfr`, one generation for `go-trace`.
-- **Single writer**: a container has exactly one writer at a time. A typical
+- **Single writer** (VIRC): a container has exactly one writer at a time. A typical
   writer is a collector that assembles finished inputs (JFR from a host JVM,
   VIREL from a profiler, a Go trace from an embedded library). Runtimes do not
   share one container writer. Records of different streams MAY interleave.
 - **Conformance levels**:
-  - *Container conformance* (every reader and writer): header, records,
-    descriptors, manifest, recovery, and byte-exact extraction of any stream.
-  - *Native decoding* (every reader): decoding `virel` streams (§3.9, §4–§5).
+  - *VIRL conformance* (every reader): reading VIRL files and `virel`
+    streams, including streaming chunks (§3.9, §3.9.6, §4–§5).
+  - *Container conformance* (every reader; writers that write VIRC): header,
+    records, descriptors, manifest, recovery, and byte-exact extraction of any
+    stream.
   - *Payload decoders* (OPTIONAL, per format, §6.1): decoding another
     format's stream into the VIREL model. Readers provide them as plugins
     selected by the descriptor's `format` id (and `format-version`). A reader
@@ -137,7 +156,7 @@ All fixed-width fields are big-endian (§2).
 
 | off | len | field | notes |
 |----:|----:|---|---|
-| 0 | 8 | signature | `89 56 52 4C 0D 0A 1A 0A` (`\x89VRL\r\n\x1a\n`). PNG-style: detects 7-bit, CR/LF and DOS-EOF damage. Distinct from the chunk magics `VIRL` and `FLR\0`. |
+| 0 | 8 | signature | `56 49 52 43 0D 0A 1A 0A` (`VIRC\r\n\x1a\n`). `VIRC` names the container next to `VIRL`; the PNG-style tail detects CR/LF and DOS-EOF damage. |
 | 8 | 2 | container major | 0 = this draft |
 | 10 | 2 | container minor | additive only |
 | 12 | 2 | header size | 32 in major 0 |
@@ -360,8 +379,15 @@ validate the END record, then read the manifest at the offset it gives.
 - A live reader that finds an OPEN record decodes its payload under that
   format's own live rules (for `virel`: the chunk seqlock, §3.9.3). A CLOSED
   record whose dynamic CRC does not match is a torn read and is read again.
-- A native profiler writes one record per chunk. The chunk keeps its own
-  header seqlock inside the payload.
+- A native profiler that writes VIRC instead of VIRL writes one record per
+  chunk; the chunk keeps its own header protocol inside the payload.
+- **Streaming profile (non-seekable sinks)**: a writer that cannot seek
+  (pipe, socket, append-only upload) MUST NOT write OPEN records. It writes
+  only CLOSED records, cutting `stream`-framed streams at bounded sizes or
+  intervals (any byte boundary is allowed, §3.1). MANIFEST and END follow at
+  the end as usual. The container then streams at one record header
+  (56 bytes) per record. Payloads that themselves need to stream use their
+  format's own streaming mode (for `virel`: §3.9.6).
 
 ### 3.7 Truncation and recovery
 
@@ -391,24 +417,33 @@ file size before use. They SHOULD enforce a configurable maximum record
 payload. They MUST validate the record at a manifest offset before trusting
 it. Payload decoders run on untrusted bytes.
 
-### 3.8 Bare legacy files (reader convenience)
+### 3.8 Opening files
 
-A reader MAY open a file that is not a container as a container with one
-implicit stream, detected by its leading bytes:
+Readers identify a file by its leading bytes:
 
-- `FLR\0` → `jfr`;
-- `VIRL` → `virel` (pre-container drafts and stream extracts);
-- `go 1.` followed by a Go trace header → `go-trace`.
+- `VIRC\r\n\x1a\n` → a VIRC container (normative);
+- `VIRL` → a VIRL file (normative), read as one `virel` stream;
+- reader convenience, not normative: `FLR\0` → a bare `jfr` stream; `go 1.`
+  followed by a Go trace header → a bare `go-trace` stream.
 
 Formats without a reliable signature, such as Perfetto protobuf, need the
-format named explicitly. This is a reader feature, not part of the container
-grammar. Magic scanning (§3.9.5) belongs to the `virel` and `jfr` decoders.
+format named explicitly. Magic scanning (§3.9.5) belongs to the `virel` and
+`jfr` decoders.
 
-### 3.9 Chunk-stream payloads: `virel` and `jfr`
+### 3.9 VIRL files and the `virel`/`jfr` chunk-stream payloads
 
-The `virel` and `jfr` payload formats are each a concatenation of chunks. A
-chunk begins with its header and spans exactly `size` bytes (header, content
-and pools). A decoder MAY attach at any chunk boundary without reading earlier
+A **VIRL file** is a `virel` chunk stream stored on its own. The `virel` and
+`jfr` payload formats are each a concatenation of chunks. A finalized chunk
+begins with its header and spans exactly `size` bytes (header, content and
+pools); a streaming chunk (§3.9.6) extends through its END_OF_PARTITION
+event.
+
+**Concatenation (normative)**: every chunk is self-contained (its metadata
+carries the full declared set, §5.1), so concatenating VIRL files yields a
+valid VIRL file. Dynamic type-id bindings are scoped to the chunk's writer id
+(§5.1), so files from different writers concatenate without conflict.
+Writers whose output may be concatenated with other writers' output SHOULD
+mint a non-zero writer id. A decoder MAY attach at any chunk boundary without reading earlier
 chunks, but MUST resolve declared types and pools within the chunk's own
 scope. In a container, writers SHOULD put exactly one chunk per DATA record,
 so a decoder can attach at record boundaries without scanning.
@@ -478,16 +513,15 @@ Native chunks use `VIRL` at offsets 0..3; offsets 4..67 retain the Annex
 | 4..65 | | as annex | |
 | 64 | 1 | file state | 0 = COMPLETE; 0xff = UPDATING |
 | 65 | 1 | pad | |
-| 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
+| 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK; bit 2 = STREAMING (§3.9.6, PROPOSED) (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
 | 68 | 8 | **writer id (NEW)** | `u64` BE, random per writer (Perfetto-TrackDescriptor-uuid style); discoverable at chunk attach; required by the one-writer-per-chunk rule [find-superset-goal] |
 
 **Ratified**: writer-id = 64-bit random (zero = null/writer-unspecified,
 e.g. single-writer converters that do not wish to mint ids).
 
-**Container overlap (open, 2026-10-04)**: inside a container, the magic,
+**Container overlap (open)**: when a VIRL stream sits inside VIRC, its magic,
 signature bit, size and live seqlock partly duplicate record framing (§3.3,
-§3.6). The native header stays unchanged for now. Slimming it is a separate,
-later step [find-agnostic-container].
+§3.6). They stay because VIRL is also a file kind of its own (§3.1).
 
 #### 3.9.3 Chunk live-write protocol (seqlock)
 
@@ -539,6 +573,32 @@ This gives the decoder STRUCTURAL resilience to any JFR evolution — a future J
 readers skip what they do not know and never clash with a version space
 they cannot coordinate with. Supporting a future JFR annex (e.g. real JFR
 major 3) is later a pure spec revision, additive in both directions.
+
+#### 3.9.6 Streaming chunks (native only; PROPOSED 2026-10-05)
+
+A writer that cannot seek writes **streaming chunks** [find-container-split]:
+
+- The header is written once and never patched: `chunk size` = 0, last
+  state snapshot offset = 0, duration = 0, state = 0x00, STREAMING flag set
+  (@67 bit 2), FINAL-CHUNK clear. Metadata offset, start nanos, start ticks,
+  ticks per second and writer id hold their normal values; the metadata
+  event SHOULD be the first event (offset 76).
+- The chunk MUST end with an END_OF_PARTITION event (type id 8, §4.4).
+  A reader finds the extent by walking size-prefixed events (§4) from offset
+  76 through that event. Events are written whole, so the walk never needs a
+  patched field.
+- Everything the posthoc header fields would give is in-band: state
+  snapshots chain backward through `delta` from the last one before
+  END_OF_PARTITION, and that snapshot's type summary (§4.4) is the chunk's
+  index. The seqlock (§3.9.3) does not apply.
+- **Live reading**: a reader tailing a growing streaming chunk consumes each
+  event once its full size is present. An incomplete event at end of data
+  means "wait" for a live reader and "truncated" otherwise.
+- **Truncation**: a streaming chunk without END_OF_PARTITION at end of data
+  is incomplete; its parseable events are consumed (§3.9.4). There is no
+  FINAL-CHUNK marker: a stream ends cleanly when its last chunk is complete.
+- A writer on a seekable sink MAY still write streaming chunks. JFR annex
+  chunks (majors 1/2) have no streaming mode; they stay byte-frozen.
 
 ---
 
@@ -689,7 +749,7 @@ numerics (all under m0; ids are the declared types' local ids, not magic):
 | CLOCK | (clock-id, value, frequency) tuples | multi-clock extension table |
 | LOSS | writer id, lost range | ring-buffer/flight-recorder loss (Perfetto previous_packet_dropped analog) |
 | CLEAR | writer id | incremental-state cleared (Perfetto SEQ_INCREMENTAL_STATE_CLEARED analog) |
-| END_OF_PARTITION | — zero-payload event (declared fieldless): Go EndOfGeneration / chunk finalize marker; verified = gates 3/5 |
+| END_OF_PARTITION | — zero-payload event (declared fieldless), registered type id 8 (m0 local 8): Go EndOfGeneration / chunk finalize marker; MUST terminate a streaming chunk (§3.9.6); verified = gates 3/5 |
 
 Cadence: writers SHOULD write a state snapshot within a durability window (e.g. ≤ 1 s
 of event time or ≤ a few MB); normative readers rely on sync points only up
@@ -705,9 +765,10 @@ ev-parser-unknown-handling].
 - Declared types live **in-stream** (self-describing; no out-of-band schema,
   no registry dependency — the migration property #3 [find-migration-
   strategy]).
-- **Type-id bindings are stream-global and ADD-ONLY**: a binding made in
-  any chunk holds for the whole `virel` stream (before 2026-10-04: the whole
-  container); bindings are never re-bound;
+- **Type-id bindings are ADD-ONLY**. Registered ids ([2, 2³⁰), §5.3) are
+  global. Dynamic ids ([2³⁰, 2⁶²)) are scoped to the chunk's writer id within
+  a stream, so concatenated VIRL files of different writers never conflict
+  (§3.9). Within that scope a binding is never re-bound;
   redefinition = stream violation [find-type-id-model].
 - **Metadata and state snapshots are separate with a one-way dependency.**
   Metadata declares `typeId` and field layouts and needs no pool state. A
@@ -765,7 +826,7 @@ ev-validator-jfr-annex, MetadataReader.java].
 | 0 | metadata event (bootstrap) |
 | 1 | checkpoint event (bootstrap) |
 | [2, 2³⁰) | module-REGISTERED: ledger-assigned `(module u12) << 18 \| local u18` — 4096 modules × 262,144 types |
-| [2³⁰, 2⁶²) | DYNAMIC: writer-assigned, per stream, add-only |
+| [2³⁰, 2⁶²) | DYNAMIC: writer-assigned, scoped per writer id within a stream, add-only |
 | [2⁶², 2⁶⁴) | SYSTEM/RESERVED (format-internal, experiments) |
 
 Annex chunks (v2): ids are as JFR v2 emits them — small first-come ids
@@ -886,6 +947,9 @@ the conformance ladder makes it testable:
 
 ## 7. Evolution rules
 
+- File kinds [find-container-split]: VIRL (`VIRL` chunk magic) and VIRC
+  (`VIRC\r\n\x1a\n` signature) evolve independently: VIRL by native
+  majors/minors, VIRC by container majors/minors.
 - Container [find-agnostic-container]: container major 0 = this draft;
   readers reject unknown container majors; minors are additive. The record
   kind registry, descriptor keys and format ids are append-only. A stream
@@ -943,7 +1007,7 @@ model`, `hyp-metadata-encoding`, `find-superset-goal`, `find-coverage-
 matrix`, `find-otlp-profile-mapping`, `find-migration-strategy`, `find-
 conversion-provenance`, `find-converter-cost`, `find-exec-trace-vocabulary`,
 `find-format-sketch`, `find-streaming-primitives`, `find-consumer-matrix`,
-`find-design-deltas`, `find-agnostic-container`, `q-composite-container`,
+`find-design-deltas`, `find-agnostic-container`, `find-container-split`, `q-composite-container`,
 `ev-go-split-clock`, `ev-perfetto-split-clock`, `ev-node-split-clock`,
 `find-event-scope`.
 
@@ -956,8 +1020,9 @@ profiler OutputFormats/ProfilerOptions/JfrVisualization docs.
 
 ## 11. Machine-readable artifacts shipped with the spec [find-idl-codegen]
 
-- `tcf-framing.ksy` — Kaitai Struct description of the container records and
-  of the `virel`/`jfr` chunk header layer (SHIPPED, doc/tcf-framing.ksy;
+- `tcf-framing.ksy` — Kaitai Struct description of the VIRC container records
+  and of VIRL / `virel`/`jfr` chunk streams, including streaming chunks walked
+  to END_OF_PARTITION (SHIPPED, doc/tcf-framing.ksy;
   recovery scanning and the foreign-bridge algorithm stay normative prose
   §3.7/§3.9.5 + reference reader by design). Compiles with
   kaitai-struct-compiler 0.11; container_gate.py checks the generated parser
