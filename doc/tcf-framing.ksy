@@ -5,18 +5,19 @@
 #     parsed from a stream reconstructed by concatenating its DATA payloads.
 # Cross-checked by validators/: tcf_reader.py (annex + native accept/reject,
 # foreign bridging), go_gate.py / perfetto_gate.py / pprof_gate.py /
-# ctef_gate.py (native emit) — chunk layer only. The CONTAINER part is a
-# DRAFT (2026-10-04): no validator or compiler run has checked it yet.
+# ctef_gate.py (native emit). Compiled with kaitai-struct-compiler 0.11 (python, java,
+# cpp_stl, go); container_gate.py step 7 checks the generated parser against
+# virel_container.py on a real multi-format container and its virel/jfr chunk streams.
 # Conveniences, never substitutes (spec §11).
 # NOTE: recovery scanning (§3.7) and the foreign-chunk bridge (resync to the
 # next FLR or VIRL magic, §3.9.5) are intentionally NOT modeled — they are
 # normative prose plus the reference reader; a .ksy can only describe
 # WELL-FORMED, CLOSED containers (no OPEN record).
 meta:
-  id: tcf-framing
+  id: tcf_framing
   title: VIREL — Versioned In-band Runtime Event Ledger — container (major 0) and chunk framing (majors 0..2)
   endian: be
-  applications-source: doc/TraceContainerFormat.md sections 3 and 4
+  # normative source: doc/TraceContainerFormat.md sections 3 and 4
 seq:
   - id: header
     type: container_header
@@ -187,7 +188,7 @@ types:
       - id: header
         type: tcf_header
       - id: body
-        size: 'header.native ? header.chunk_size - 76 : header.chunk_size - 68'
+        size: 'header.is_native ? header.chunk_size - 76 : header.chunk_size - 68'
   tcf_header:
     seq:
       - id: magic
@@ -223,11 +224,11 @@ types:
                             # HIGH byte bits 0..6 = default metadata-encoding id, 0..127.
       - id: writer_id
         type: u8            # RANDOM per chunk writer, != 0 (native 76-byte header only)
-        if: native
+        if: is_native
     instances:
       signature_set:
         value: (flags_word & 0x8000) != 0
-      native:
+      is_native:
         value: magic == 0x5649524c and signature_set
 enums:
   record_kind:

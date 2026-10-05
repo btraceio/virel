@@ -157,7 +157,7 @@ A writer opens a record with state OPEN and an all-ones length, then appends pay
 
 ### 3.7 Truncation and recovery
 
-A container is cleanly closed iff a valid END record is present. A reader walks records by length. On an invalid record it scans forward for `VREC`, resumes at the first candidate that passes the static and dynamic checks, and reports the skipped bytes. A stream is complete when its DATA sequences run 0..n without gaps and record n has STREAM_END; only a complete stream is byte-exact. An incomplete stream extracts as its surviving payloads in order, with gaps reported.
+A container is cleanly closed iff a valid END record is present. A reader walks records by length. On an invalid record it scans forward for `VREC`, resumes at the first candidate that passes the static and dynamic checks, and reports the skipped bytes. A stream is complete when its DATA sequences run 0..n without gaps and record n has STREAM_END; only a complete stream is byte-exact. An incomplete stream extracts as its surviving payloads in order, with gaps reported. A record whose payload CRC does not match stays in the walk but makes its stream incomplete.
 
 ### 3.8 Bare legacy files
 

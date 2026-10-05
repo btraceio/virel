@@ -41,9 +41,12 @@ def fv(v):
         return {"v": {"fields": [{"name": k, "value": fv(x)} for k, x in v.items()]}}
     return {"v": None}
 
-def to_model(data: bytes) -> dict:
+def chunk_models(data: bytes) -> list:
+    """a virel/jfr chunk stream -> list of avsc Chunk records"""
+    import io, contextlib
     r = Reader(); r.record = True
-    r.run(data)
+    with contextlib.redirect_stdout(io.StringIO()):
+        r.run(data)
     chunks = []
     for cm in r.chunk_models:
         chunk = {k: v for k, v in cm.items() if k != "major_minor"}
@@ -72,6 +75,54 @@ def to_model(data: bytes) -> dict:
                         "typeSummary": cp["typeSummary"], "pools": pools})
         chunk["stateSnapshots"] = cps
         chunks.append(chunk)
+    return chunks
+
+def container_model(data: bytes) -> dict:
+    """a real container (spec §3) -> virel.model.Container; virel and jfr streams are decoded"""
+    import virel_container as vc
+    cr = vc.ContainerReader(data)
+    typed = {"format-version": "formatVersion", "source": "source", "producer": "producer", "label": "label"}
+    streams = []
+    for sid, st in sorted(cr.streams.items()):
+        desc = {"format": st.fmt or "", "contentEncoding": st.get("content-encoding", "identity"),
+                "recordFraming": "MESSAGE" if st.framing == "message" else "STREAM",
+                "inputTruncated": any(k == "input-truncated" for k, _ in st.keys),
+                "entries": [{"key": k, "value": v} for k, v in st.keys],
+                "clockAnchors": [vc.decode_anchor(v) for k, v in st.keys if k == "clock-anchor"],
+                "derivedFrom": [vc.dec_varint(v, 0)[0] for k, v in st.keys if k == "derived-from"]}
+        for k, field in typed.items():
+            if st.get(k) is not None:
+                desc[field] = st.get(k)
+        if st.get("writer-id") is not None:
+            desc["writerId"] = struct.unpack(">q", dict(st.keys)["writer-id"])[0]
+        recs = [{"offset": r.offset, "kind": vc.KIND_NAMES[r.kind], "headerSize": r.header_size,
+                 "streamId": r.stream_id, "sequence": r.sequence, "open": r.state == vc.STATE_OPEN,
+                 "streamEnd": bool(r.flags & vc.F_STREAM_END), "preamble": bool(r.flags & vc.F_PREAMBLE),
+                 "resync": bool(r.flags & vc.F_RESYNC),
+                 "payloadLength": None if r.state == vc.STATE_OPEN else r.length,
+                 "timeStartNanos": r.t0, "timeEndNanos": r.t1,
+                 "payloadCrc": r.payload_crc if r.flags & vc.F_PAYLOAD_CRC else None}
+                for r in st.records_by_seq()]
+        decoded = st.fmt in ("virel", "jfr") and st.complete()
+        streams.append({"streamId": sid, "descriptor": desc, "records": recs, "complete": st.complete(),
+                        "gaps": st.gaps(), "decoder": st.fmt if decoded else None,
+                        "chunks": chunk_models(cr.extract(sid)) if decoded else None})
+    m = None
+    if cr.manifest:
+        m = {"version": cr.manifest["version"],
+             "streams": [dict(x, ended=bool(x["ended"])) for x in cr.manifest["streams"]],
+             "index": cr.manifest["index"]}
+    return {"registry": avsc_registry(),
+            "header": {"major": cr.major, "minor": cr.minor, "headerSize": cr.header_size,
+                       "flags": cr.flags, "containerId": struct.unpack(">q", struct.pack(">Q", cr.container_id))[0]},
+            "streams": streams, "manifest": m, "cleanlyClosed": cr.clean, "implicit": False,
+            "damagedSpans": [{"firstOffset": a, "nextOffset": b} for a, b in cr.damaged]}
+
+def to_model(data: bytes) -> dict:
+    import virel_container as vc
+    if data[:8] == vc.SIGNATURE:
+        return container_model(data)
+    chunks = chunk_models(data)
     # Inputs are bare chunk streams; spec §3.8 opens them as an implicit container
     # with one stream whose format follows the leading magic.
     fmt = "jfr" if data[:4] == b"FLR\0" else "virel"

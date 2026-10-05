@@ -316,7 +316,10 @@ Format-specific rules that affect containers:
   the one-time config packets of the first pass.
 - **Go: skip only leading generations.** A decoder may start at any
   generation (with the preamble) but MUST then read the following generations
-  contiguously; dropping a middle generation breaks decoding.
+  contiguously. Dropping a middle generation is invalid, and the Go parser
+  does not reliably detect it: depending on the trace it fails ("inconsistent
+  status") or silently accepts the gap. Readers MUST NOT hand a stream with a
+  gap to a Go decoder as if it were complete (§3.7).
 - **Rotated Node.js trace files are separate streams**: each rotated
   `node_trace.N.log` is a complete JSON document. A trace file from a crashed
   process lacks its closing `]}`; writers SHOULD set `input-truncated`.
@@ -377,6 +380,9 @@ validate the END record, then read the manifest at the offset it gives.
   reported. A final record cut short (OPEN, or CLOSED with a length past end
   of file) contributes its bytes up to end of file and leaves its stream
   incomplete.
+- A CLOSED record whose PAYLOAD_CRC does not match keeps its place in the
+  record walk (its header is valid), but its stream is incomplete: the reader
+  reports the mismatch and MUST NOT present the stream as byte-exact.
 - Recovery inside a recovered payload follows the payload format (for
   `virel`/`jfr`: §3.9.4).
 
@@ -953,8 +959,9 @@ profiler OutputFormats/ProfilerOptions/JfrVisualization docs.
 - `tcf-framing.ksy` — Kaitai Struct description of the container records and
   of the `virel`/`jfr` chunk header layer (SHIPPED, doc/tcf-framing.ksy;
   recovery scanning and the foreign-bridge algorithm stay normative prose
-  §3.7/§3.9.5 + reference reader by design). The container part is a DRAFT:
-  no validator cross-checks it yet.
+  §3.7/§3.9.5 + reference reader by design). Compiles with
+  kaitai-struct-compiler 0.11; container_gate.py checks the generated parser
+  against the reference reader (validators/virel_container.py).
 - `m0-framing.proto` — canonical control-plane + m0 vocabulary proto
   (SHIPPED, doc/m0-framing.proto; records the Varint128 norm and the
   pooled-ref encoding split as comments).
