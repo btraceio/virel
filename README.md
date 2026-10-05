@@ -27,7 +27,11 @@ latter.
 
 ## Run the self-contained checks
 
-Python 3 is required; run from the repository root:
+[AGENTS.md](AGENTS.md) is the complete guide to verification and benchmarks:
+every gate, its prerequisites and fixtures (`validators/fixtures/`), its
+expected pass line, which gates to run for which change, writer builds and
+sanitizers, and how evidence is recorded. The quickest checks need only
+Python 3; run them from the repository root:
 
 ```sh
 python3 -B validators/tcf_reader.py --selftest
@@ -35,8 +39,9 @@ python3 -B validators/perfetto_gate.py
 python3 -B validators/build_tcf_model_avsc.py
 ```
 
-The other conversion gates require external recordings and producer tools;
-their historical `/tmp` fixture paths are not bundled test data. Existing gate
+The other gates need Go, a JDK, Node.js or a C++ compiler, and some read `/tmp`
+fixtures. `validators/fixtures/make_fixtures.sh` regenerates those fixtures,
+except the real Chrome trace used by gate 5 (see AGENTS.md). Existing gate
 results establish representation/fidelity, not native recording performance.
 Historical `tcf` filenames remain to preserve links and imports.
 
