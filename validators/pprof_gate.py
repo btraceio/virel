@@ -21,7 +21,9 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tcf_reader import Reader
 
-GOROOT = "/usr/local/Cellar/go/1.27.1/libexec"
+GOROOT = os.environ.get("GOROOT") or subprocess.run(
+    ["go", "env", "GOROOT"], capture_output=True, text=True, check=True
+).stdout.strip()
 PPROF = f"{GOROOT}/bin/go"
 MASK64 = (1 << 64) - 1
 
@@ -213,9 +215,15 @@ def parse_golden(raw):
             ap, _, r2 = rest.partition("/")
             lp, _, r3 = r2.partition("/")
             op, _, tail = r3.partition(" ")
+            # -raw 'Mappings' lines are 'file build_id [flags]'; split the
+            # build_id off so system maps ('[vdso]', no file) stay empty.
             if " [" in tail: tail = tail.split(" [")[0]
-            tail = tail.strip()
-            g["mappings"][int(tid)] = (int(ap, 16), int(lp, 16), int(op, 16), tail or None)
+            ftoks = tail.split()
+            if len(ftoks) > 1:
+                ftok, bid = " ".join(ftoks[:-1]), ftoks[-1]
+            else:
+                ftok, bid = (ftoks[0] if ftoks else ""), None
+            g["mappings"][int(tid)] = (int(ap, 16), int(lp, 16), int(op, 16), ftok or None, bid)
     return g
 
 def crosscheck(prof, got, name):
@@ -270,6 +278,9 @@ def crosscheck(prof, got, name):
         gf = st[filei] if filei is not None else None
         if gf != gg[3]:
             errs.append(f"mapping {mid} file {gf!r} vs {gg[3]!r}")
+        gb = st[bidi] if bidi is not None else None
+        if gb != gg[4]:
+            errs.append(f"mapping {mid} build_id {gb!r} vs {gg[4]!r}")
     return errs
 
 # ---------------- stage B: emit native VIREL (dynamic type ids) -------------
@@ -538,9 +549,13 @@ def verify_chunk(container, chunk_start, chunk_len, prof, srcname):
     for m in prof["mappings"]:
         got = map_entries.get(m[0])
         if not isinstance(got, dict): errs.append(f"mapping {m[0]} missing"); continue
-        want = (m[1], m[2], m[3], st[m[4]] if m[4] else None, st[m[5]] if m[5] else None,
+        want = (m[1] & MASK64, m[2] & MASK64, m[3] & MASK64,
+                st[m[4]] if m[4] else None, st[m[5]] if m[5] else None,
                 m[6], m[7], m[8], m[9])
-        have = (got.get("start"), got.get("limit"), got.get("offset"), got.get("file"),
+        have = (got.get("start") & MASK64 if got.get("start") is not None else None,
+                got.get("limit") & MASK64 if got.get("limit") is not None else None,
+                got.get("offset") & MASK64 if got.get("offset") is not None else None,
+                got.get("file"),
                 got.get("build_id"), bool(got.get("has_functions")), bool(got.get("has_filenames")),
                 bool(got.get("has_line_numbers")), bool(got.get("has_inline_frames")))
         if have != want: errs.append(f"mapping {m[0]} diff")
