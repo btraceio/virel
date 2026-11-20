@@ -27,7 +27,7 @@ VIRL — one native event stream         VIRC — a container of framed streams
 ┌────────┬────────┬────────┬─────┐      ┌──────────┬─────────┬─────────┬───┐
 │ chunk  │ chunk  │ chunk  │ ... │      │ 32-byte  │ STREAM  │  DATA   │...│
 └────────┴────────┴────────┴─────┘      │ header   │ record  │ records │   │
-  concatenable: cat a.virl b.virl        └──────────┴─────────┴─────────┴───┘
+  concatenable: cat a.virl b.virl       └──────────┴─────────┴─────────┴───┘
   writable without seeking (pipes,          each record frames one payload
   sockets, append-only storage)             stream: virel, jfr, go-trace,
                                             perfetto, otlp-traces, ...
