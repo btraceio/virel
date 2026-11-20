@@ -35,7 +35,7 @@ Run everything from the repository root. Python scripts take `-B`, which keeps
 |---|---|---|
 | Python 3 (3.14 used) | everything | standard library only for the gates |
 | C++17 compiler (`clang++`; `CXX` overrides) | gates 6 and 7, benchmarks | writer builds must have 0 warnings with `-Wall -Wextra -Wpedantic` |
-| Go (1.27 used) | gates 3, 4 and 6, fixture generation | `go tool trace` and `go tool pprof` are used as reference parsers |
+| Go (1.27 used) | gates 3, 4 and 6, fixture generation | `go tool trace` and `go tool pprof` are used as reference parsers. The toolchain running `go tool trace` must be ≥ the generator's: a `go tool trace` older than the fixture's trace version fails with `unknown or unsupported trace version go 1.26`. If the default `go` is older than 1.27, run gate 3 with `GOTOOLCHAIN=go1.27.1` (the fixture-generating toolchain, auto-downloaded by `make_fixtures.sh`) |
 | JDK with `java` and `jfr` (26 used) | gate 6 | records a multi-chunk JFR file; `jfr summary` is the reference parser |
 | Node.js (24 used) | fixture generation (gate 5) | `node --cpu-prof` |
 | Kaitai Struct compiler 0.11 + `kaitaistruct` runtime | gates 6 and 7, optional | without them the Kaitai step reports SKIP and the gate still passes |
