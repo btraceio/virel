@@ -18,10 +18,16 @@ Run everything from the repository root. Python scripts take `-B`, which keeps
 - `benchmarks/`: the C++ native writer prototype (`generation_writer.cpp`),
   its runner and output validator, and the older capture/encoding pipeline
   experiment.
-- `evidence/`: recorded benchmark results plus frozen sources.
-- `WORK.md`: current decisions and open items. `.investigations/jfr-spec/`:
-  the investigation memory graph. `.investigations/.active` is a
-  session-local lock; never commit it.
+- `tutorials/`: the reader on-ramp (mental model, reading, writing,
+  container, glossary), all executable with Python 3 against `validators/`.
+- `.knowledgebase/memories/`: distilled design decisions — the ratified
+  constraints behind the spec (why `FLR\0` stays JFR-only, add-only
+  type-id bindings, writer direction). Consult it before changing the
+  format; contradicting a memory requires a formal supersede.
+- Local-only, gitignored: `WORK.md` (current decisions and open items),
+  `.investigations/` (the investigation memory graph; `.active` is a
+  session-local lock), `evidence/` (recorded benchmark results plus frozen
+  sources). None of these are committed.
 
 ## Prerequisites
 
@@ -177,15 +183,15 @@ chunks from `native_output_checks` in the JSON.
 The native and signal runs together exceeded 10 minutes on a loaded host, so
 run long suites in the background.
 
-**Recording evidence** (`evidence/`):
+**Recording evidence** (local-only `evidence/`, never committed):
 
 1. Run with the default 5 repeats into `evidence/generation-writer-<suite>.json`.
    The `.md` table is written next to it.
 2. Freeze the measured source:
    `cp benchmarks/generation_writer.cpp evidence/generation-<experiment>-source.cpp`.
    Check that its SHA-256 equals `source_sha256` in the JSON.
-3. Summarize in `benchmarks/generation-writer.md` with links to the table,
-   JSON and source.
+3. Summarize the durable conclusion in `benchmarks/generation-writer.md`
+   (committed), with the numbers; link the JSON by path, not by copy.
 4. Do not run gates or other heavy work concurrently.
 5. The runner records `load_average_before` and `load_average_after`. On a
    loaded host, CPU comparisons are noise: report them as such and rely on
@@ -197,4 +203,5 @@ run long suites in the background.
 - One logical change per commit.
 - The body says why the change was made and lists the verification as
   `command → key result line`.
-- Never commit `.investigations/.active` or scratch artifacts.
+- The investigation layer is gitignored (`.investigations/`, `WORK.md`,
+  `STATE.md`, `INDEX.md`, `evidence/`); never commit scratch artifacts.
