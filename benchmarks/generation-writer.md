@@ -1,5 +1,7 @@
 # Pooled generation writer benchmark
 
+Raw run records and frozen sources live in the local `evidence/` snapshot, which is not committed; paths below refer to it.
+
 This prototype investigates producer encoding with bounded generation ownership,
 pool references, background draining and cooperative rotation. It does not ratify
 the proposed policy. The maintained protocol remains draft 0.1.
@@ -137,17 +139,17 @@ all output bytes and events. It separately decodes accepted ZigZag starts becaus
 the maintained reader's native timestamp interpretation remains pending.
 
 The first component-only run remains in
-[generation-writer-initial.md](../evidence/generation-writer-initial.md) and
-[raw JSON](../evidence/generation-writer-initial.json), with its source snapshot
-in [evidence](../evidence/generation-component-source.cpp). It used an experimental
+generation-writer-initial.md (`evidence/generation-writer-initial.md`) and
+raw JSON (`evidence/generation-writer-initial.json`), with its source snapshot
+in evidence (`evidence/generation-component-source.cpp`). It used an experimental
 envelope, background per-entry definition emission and a different handle-binding
 path, at 100k attempts/s. Compare architectures within the new native run;
 comparing those two runs does not isolate the cost of native headers.
 
 ## Initial native results
 
-[140 native runs](../evidence/generation-writer-native.md) and
-[raw observations](../evidence/generation-writer-native.json) record five
+140 native runs (`evidence/generation-writer-native.md`) and
+raw observations (`evidence/generation-writer-native.json`) record five
 repetitions, 40k attempts per producer at 50k attempts/s, plus saturation.
 All ordinary paced cases completed without drops in every repetition. This
 lower rate was chosen after some 100k/s component runs lost events; those
@@ -190,7 +192,7 @@ are the evidence for that fault, not ordinary p99.
 Recorded C++ allocation counts were zero in all measured recording/worker paths.
 Nineteen file-producing verification cases independently decoded 1820 native
 chunks. Six ASan/UBSan cases and three TSan cases passed; see
-[validation details](../evidence/generation-writer-validation.md).
+validation details (`evidence/generation-writer-validation.md`).
 
 The candidate is viable within the tested scope. The clearest next improvement
 is to decouple timely partial-buffer publication from chunk rotation, preserving
@@ -234,9 +236,9 @@ validator: 12 files, 405 chunks.
 
 ### Results
 
-[150 runs](../evidence/generation-writer-publication.md),
-[raw JSON](../evidence/generation-writer-publication.json),
-[source snapshot](../evidence/generation-publication-source.cpp).
+150 runs (`evidence/generation-writer-publication.md`),
+raw JSON (`evidence/generation-writer-publication.json`),
+source snapshot (`evidence/generation-publication-source.cpp`).
 Medians across five repeats:
 
 | Case | No early publication p50 | Producer flush 1 ms p50 | Background age 1 ms p50 | Background age 100 µs p50 |
@@ -312,9 +314,9 @@ handler entries can be fewer than signals sent.
 
 ### Results
 
-[60 runs](../evidence/generation-writer-signal.md),
-[raw JSON](../evidence/generation-writer-signal.json),
-[source snapshot](../evidence/generation-signal-source.cpp). Medians across five
+60 runs (`evidence/generation-writer-signal.md`),
+raw JSON (`evidence/generation-writer-signal.json`),
+source snapshot (`evidence/generation-signal-source.cpp`). Medians across five
 repeats, 4 producers, depth 32 unless noted:
 
 | Scenario | Handler p50 intern / stage | Output bytes/sample intern / stage | Lane bytes/sample intern / stage | Background ns/sample intern / stage | Loss intern / stage |
@@ -369,9 +371,9 @@ generation (1,024 entries, the same total budget), shared by all lanes:
 - Reset happens only when the generation is unpinned, under the same hazard
   protocol as the rest of the prototype.
 
-[105-run 3-way table](../evidence/generation-writer-signal-3way.md),
-[raw JSON](../evidence/generation-writer-signal-3way.json),
-[source](../evidence/generation-signal-3way-source.cpp). This run repeats S1/S2
+105-run 3-way table (`evidence/generation-writer-signal-3way.md`),
+raw JSON (`evidence/generation-writer-signal-3way.json`),
+source (`evidence/generation-signal-3way-source.cpp`). This run repeats S1/S2
 alongside S3 and adds `churn-10khz` (1,024 shared stacks, 10 kHz, 2-ms
 rotation) to force concurrent inserts. Medians:
 
@@ -430,9 +432,9 @@ Modes:
   background published it, and the background writes that stack's definition
   before draining any other span.
 
-[120-run table](../evidence/generation-writer-signal-scale.md),
-[raw JSON](../evidence/generation-writer-signal-scale.json),
-[source](../evidence/generation-signal-scale-source.cpp). The normal lane runs
+120-run table (`evidence/generation-writer-signal-scale.md`),
+raw JSON (`evidence/generation-writer-signal-scale.json`),
+source (`evidence/generation-signal-scale-source.cpp`). The normal lane runs
 at 5k events/s per thread. Medians over 5 repeats:
 
 | Scenario | Handler p50 stage / global / hybrid (µs) | Handler p99 s / g / h (µs) | Lane bytes/sample s / g / h | Hybrid hit % | Background ns/sample s / g / h |
@@ -508,7 +510,7 @@ nested `SIGPROF` at one of four points:
 - between the lane space check and the append;
 - mid-append, before the committed count is published.
 
-[Results](../evidence/signal-reentry-validation.md):
+Results (`evidence/signal-reentry-validation.md`):
 
 - With one level, every injected re-entry was dropped and counted.
 - With two levels, every injected re-entry was recorded.
@@ -546,9 +548,9 @@ The suite has two parts.
 
 ### Results
 
-[60 runs](../evidence/generation-writer-streaming.md),
-[raw JSON](../evidence/generation-writer-streaming.json),
-[source](../evidence/generation-streaming-source.cpp). Validation covered 11
+60 runs (`evidence/generation-writer-streaming.md`),
+raw JSON (`evidence/generation-writer-streaming.json`),
+source (`evidence/generation-streaming-source.cpp`). Validation covered 11
 verified streaming runs: three to a file with finalize-on-close, one through a
 FIFO and one finalize-on-close run through a FIFO. Together: 1,602 chunks,
 488,203 events and 79,788 samples.

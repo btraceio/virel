@@ -111,8 +111,8 @@ latency and CPU differ for these concrete capture/encoding paths.
 
 ## Initial local run
 
-The [60-run table](../evidence/writer-pipeline-initial.md) and
-[raw observations](../evidence/writer-pipeline-initial.json) preserve three repeats
+The 60-run table (`evidence/writer-pipeline-initial.md`) and
+raw observations (`evidence/writer-pipeline-initial.json`) preserve three repeats
 of the seven scenarios (no direct mode for rebasing), with 200k attempts per
 producer per run, on the recorded macOS/x86-64 environment.
 

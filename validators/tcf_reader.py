@@ -104,7 +104,7 @@ class Cursor:
     def bytes_(self, n):
         self.assert_avail(n, "bytes"); r = self.d[self.pos:self.pos+n]; self.pos += n; return r
 
-# ---------- metadata (annex: binarized-XML v2) [ev-metadata-event, MetadataReader.java] ----------
+# ---------- metadata (annex: binarized-XML v2; mirrors JDK MetadataReader.java) ----------
 
 class Field:
     __slots__ = ("name", "type_id", "dimension", "constant_pool", "annotation_refs")
