@@ -67,7 +67,8 @@ sh validators/fixtures/make_fixtures.sh
 | `/tmp/tcf-gotrace.out` | `validators/fixtures/gotrace` (Go `runtime/trace`) | gate 3 |
 | `/tmp/tcf-pprof-cpu.pprof`, `/tmp/tcf-pprof-heap.pprof` | `validators/fixtures/pprof` (Go `runtime/pprof`) | gate 4 (a wire regression test; pprof is out of scope as a format) |
 | `/tmp/tcf-cpuproffix/*.cpuprofile` | `validators/fixtures/cpuprofile/work.js` via `node --cpu-prof` | gate 5 |
-| `/tmp/tcf-ctef-real.json` | a real Chrome DevTools trace export; **not reproducible here** | gate 5 (first argument overrides the path) |
+| `/tmp/tcf-ctef-real.json` | a real Chrome DevTools trace export; **not reproducible here** | gate 5 (used when present; first argument overrides) |
+| `/tmp/tcf-ctef-synthetic.json` | `validators/fixtures/ctef/gen.py` (synthetic stand-in, 4 processes, nested B/E + i) | gate 5 fallback when the real export is absent |
 
 Gates 6 and 7 build their own inputs in a temporary work directory and delete
 it afterwards. Set `VIREL_GATE_WORK=<dir>` to keep and reuse the inputs; gate

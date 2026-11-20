@@ -4,7 +4,10 @@ V8 .cpuprofile JSON -> native VIREL (and back to CTEF).
 
 Fixtures are REAL producers: a real Chrome DevTools trace export
 (/tmp/tcf-ctef-real.json, 1866 B/E events, 4 processes) and a real
-`node --cpu-prof` profile. Tier B = vocabulary level: fidelity is per
+`node --cpu-prof` profile. The real trace export is not reproducible, so
+make_fixtures.sh generates an equivalent-shape synthetic stand-in
+(/tmp/tcf-ctef-synthetic.json, 4 processes, nested B/E + i); the real
+one is used when present. Tier B = vocabulary level: fidelity is per
 documented shape transform (X -> B/E pair; E names recovered by nesting;
 cpuprofile tree -> pooled leaf-first stacks), not byte identity.
 """
@@ -447,9 +450,16 @@ def cpu_verify(container, g, key_of, sk):
     return errs
 
 # ---------------- main ------------------------------------------------------
-def main(ctef_path="/tmp/tcf-ctef-real.json", cpu_path=None):
+def main(ctef_path=None, cpu_path=None):
     t0 = time.time()
     ok = True
+    if ctef_path is None:
+        for cand in ("/tmp/tcf-ctef-real.json", "/tmp/tcf-ctef-synthetic.json"):
+            if os.path.exists(cand):
+                ctef_path = cand; break
+        if ctef_path is None:
+            raise SystemExit("no CTEF fixture: pass a path as the first argument "
+                             "or run validators/fixtures/make_fixtures.sh")
     if cpu_path is None:
         import glob
         cands = sorted(glob.glob("/tmp/tcf-cpuproffix/*.cpuprofile"))
