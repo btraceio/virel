@@ -83,9 +83,9 @@ class Cursor:
     def u1(self):
         self.assert_avail(1, "u1"); b = self.d[self.pos]; self.pos += 1; return b
     def varint(self):  # LEB128, <=9 bytes, 9th = raw 8 bits  [RecordingInput.readLong L298-355]
-        self.assert_avail(1, "varint")
         v = 0; shift = 0
         for i in range(9):
+            self.assert_avail(1, "varint")   # every continuation byte: a varint may straddle end-of-data
             b = self.d[self.pos]; self.pos += 1
             if i == 8:
                 v |= (b & 0xFF) << shift; break
@@ -192,6 +192,7 @@ class Reader:
         self.event_bytes = defaultdict(int) # typeId -> parsed payload bytes (size accounting per event)
         self.locks = {}                     # typeId -> (has_duration, has_thread, has_stack) — inferred once, verified always
         self.foreign_spans = []
+        self.truncated_spans = []           # (start, end) of unparsable tails, spec §3.9.4
         self.chunks = 0
 
     # -- value parsing; returns python value or (kind,) marker
@@ -307,12 +308,22 @@ class Reader:
 
     # -- events walk (annex: absolute ticks; empirically lock implicit words per typeId)
     def walk_events(self, cur, chunk_start, header_size, chunk_end, native=False):
+        """Walk size-prefixed events to chunk_end, clamped at end of data. A declared
+        extent past EOF (finalized chunk never finalized, spec §3.9.4) or an event
+        that does not fully fit before end of data (incomplete event, spec §3.9.6)
+        ends the walk: content up to the last parseable event SHALL be consumed
+        (§3.9.4) and the unparsable tail is reported as a truncated span."""
+        walk_end = min(chunk_end, len(cur.d))
         pos = chunk_start + header_size
         cur.pos = pos
-        while cur.pos < chunk_end:
+        while cur.pos < walk_end:
             ev_start = cur.pos
-            size = cur.varint()
-            if size <= 0 or ev_start + size > chunk_end: raise IOError(f"bad event size {size} at {ev_start}")
+            try:
+                size = cur.varint()
+            except IOError:
+                break                       # torn size varint at end of data
+            if size <= 0 or ev_start + size > walk_end:
+                break                       # incomplete/torn event at end of data
             end = ev_start + size
             tid = cur.varint()
             if tid == 0:                                    # metadata event (re-read via header pointer; skip here)
@@ -355,7 +366,11 @@ class Reader:
                 raise IOError(f"event walk mismatch eventId={tid} @{ev_start}: end {end} vs {cur.pos}")
             self.event_bytes[tid] = size
             self.stats[self.tname(tid)] += 1
-        return cur.pos == chunk_end
+        if cur.pos < walk_end:
+            self.truncated_spans.append((cur.pos, walk_end))
+            print(f"  truncated: events consumed up to {cur.pos}; "
+                  f"{walk_end - cur.pos} tail bytes unparsed (spec §3.9.4)")
+        return cur.pos == walk_end
 
 
     def tname(self, tid):
@@ -421,24 +436,31 @@ class Reader:
             print(f"chunk @{pos}: class {kind} major {major}.{minor} size {size} "
                   f"meta@{meta_off} nanos {start_nanos}..{start_nanos+dur_nanos} ticks@{start_ticks} freq {tps}")
             if kind == "annex" or kind == "native":
-                # metadata at header pointer
-                mcur = Cursor(data, pos + meta_off, pos + size)
+                # metadata at header pointer (end clamped: a truncated chunk may
+                # declare a size past EOF, spec §3.9.4)
+                mcur = Cursor(data, pos + meta_off, min(pos + size, len(data)))
                 if self.accept_candidate_metadata(mcur):
-                    mcur.varint()                # size (payload event size)
-                    mcur.varint()                # typeId == 0
-                    ts_m = mcur.varint()         # timestamp
-                    dur_m = mcur.varint()        # duration
-                    mid_m = mcur.varint()        # metadataId (cross-chunk dedup id)
-                    enc_m = mcur.varint() if kind == "native" else 0   # envelope encoding tag (0 = xml-v2)
-                    pool, root = read_metadata_payload(mcur)
-                    self.types = build_types(pool, root)
-                    nty = sum(1 for t in self.types.values() if t.super)
-                    print(f"  metadata: {nty} event types of {len(self.types)} declared, pool {len(pool)} strings")
-                    if self.record:
-                        self.meta_preamble = (ts_m, dur_m, mid_m)
-                        self.meta_pool = pool
-                        self.meta_root = root
-                        self.meta_encoding = enc_m
+                    try:
+                        mcur.varint()                # size (payload event size)
+                        mcur.varint()                # typeId == 0
+                        ts_m = mcur.varint()         # timestamp
+                        dur_m = mcur.varint()        # duration
+                        mid_m = mcur.varint()        # metadataId (cross-chunk dedup id)
+                        enc_m = mcur.varint() if kind == "native" else 0   # envelope encoding tag (0 = xml-v2)
+                        pool, root = read_metadata_payload(mcur)
+                        self.types = build_types(pool, root)
+                    except (IOError, IndexError):    # metadata event torn by truncation (spec §3.9.4)
+                        pool = root = None
+                        self.types = {}
+                        print("  metadata: truncated, pool/types unavailable (spec §3.9.4)")
+                    if pool is not None:
+                        nty = sum(1 for t in self.types.values() if t.super)
+                        print(f"  metadata: {nty} event types of {len(self.types)} declared, pool {len(pool)} strings")
+                        if self.record:
+                            self.meta_preamble = (ts_m, dur_m, mid_m)
+                            self.meta_pool = pool
+                            self.meta_root = root
+                            self.meta_encoding = enc_m
                 # event walk (pool + metadata + user events), strict accounting
                 self.walk_events(Cursor(data, pos + hdr_size), pos, hdr_size, pos + size,
                                  kind == "native")
@@ -525,8 +547,14 @@ def self_test():
     r = Reader(); r.run(bytes(buf))
     ok = r.stats.get(2, 0) == 0  # placeholder — real assertions in annex run
     print(f"selftest native chunks: {r.chunks}, foreign: {len(r.foreign_spans)}")
+    # truncation (spec §3.9.4/§3.9.6): the last chunk's declared extent runs past
+    # end of data; the reader must consume the parseable events and record a
+    # truncated tail instead of raising
+    r2 = Reader(); r2.run(bytes(buf[:-3]))
+    print(f"selftest truncated tail: spans {len(r2.truncated_spans)}")
     return (r.chunks == 2 and len(r.foreign_spans) == 1
-            and r.stats["<state-snapshot>"] == 1)
+            and r.stats["<state-snapshot>"] == 1
+            and r2.chunks == 2 and len(r2.truncated_spans) == 1)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
