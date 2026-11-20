@@ -1,0 +1,63 @@
+name: gates
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fast-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Selftest (native chunks, foreign bridging)
+        run: python3 -B validators/tcf_reader.py --selftest
+      - name: Generate fixtures
+        run: sh validators/fixtures/make_fixtures.sh
+      - name: Gate 2 - Perfetto
+        run: python3 -B validators/perfetto_gate.py
+      - name: Gate 3 - Go trace
+        run: python3 -B validators/go_gate.py /tmp/tcf-gotrace.out --full
+      - name: Gate 4 - pprof wire regression
+        run: python3 -B validators/pprof_gate.py
+      - name: Gate 5 - CTEF and V8 cpuprofile
+        run: python3 -B validators/ctef_gate.py
+      - name: Avro model must not drift
+        run: |
+          python3 -B validators/build_tcf_model_avsc.py
+          git diff --exit-code doc/tcf-model.avsc
+
+  container-gates:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Gate 6 - VIRC container on real inputs
+        env:
+          CXX: g++
+        run: python3 -B validators/container_gate.py
+      - name: Gate 7 - VIRL streaming
+        env:
+          CXX: g++
+        run: python3 -B validators/virl_stream_gate.py
