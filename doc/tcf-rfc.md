@@ -18,8 +18,9 @@ Synced with the parent draft on 2026-10-05, including the two file kinds
 This memo is an experimental draft for external review. Native major 0 remains
 the active design version and is revised in place until ratification; protocol
 design decisions do not consume new version numbers. The parent technical
-draft is a normative reference (section 12). Its numeric assignments were
-ratified on 2026-10-03.
+draft is a normative reference (section 12). This memo is a companion to `doc/TraceContainerFormat.md` in the
+repository, which carries the full wire tables and worked examples; read
+the spec for implementation detail.
 
 ## Terminology
 
@@ -217,7 +218,7 @@ Offsets 0 to 67 keep the annex semantics and positions. The size is major-scoped
 | 64 | 1 | file state | 0 = COMPLETE; 0xff = UPDATING |
 | 65 | 1 | pad | |
 | 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK; bit 2 = STREAMING (streaming vs finalized header state, section 3.9.6, PROPOSED) (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
-| 68 | 8 | **writer id (NEW)** | `u64` BE, random per writer (Perfetto-TrackDescriptor-uuid style); discoverable at chunk attach; required by the one-writer-per-chunk rule [find-superset-goal] |
+| 68 | 8 | **writer id (NEW)** | `u64` BE, random per writer (Perfetto-TrackDescriptor-uuid style); discoverable at chunk attach; required by the one-writer-per-chunk rule |
 
 Ratified by proceed (2026-10-03): the writer id is a 64-bit random value. Zero means null (writer-unspecified). Single-writer converters MAY use zero instead of an id.
 
@@ -254,10 +255,10 @@ Evidence: find-version-resilience, ev-chunk-header, ev-framing-constants, ev-liv
 Annex chunks and native major-0 chunks share one wire grammar. Only the tick-word semantics differ (section 4.2).
 
 ```
-event      = size:pvarint        // includes its own varint width
-             typeId:varint       // §5.3
-             time words          // §4.2
-             fields              // per declared type
+event = size:pvarint // includes its own varint width
+             typeId:varint // §5.3
+             time words // §4.2
+             fields // per declared type
 ```
 
 ### 4.1 Field encodings
@@ -313,7 +314,7 @@ native-state-snapshot = [size] [1] [timestamp] [duration] [delta] [snapshotFlags
                         [summaryVersion=1] [summaryTypeCount]
                         [{typeId} {emittedCount} x summaryTypeCount]
                         [poolCount] [entries...]
-entry       = [typeId] [count]
+entry = [typeId] [count]
               [{key:varint, value: FULL payload} x count]
 ```
 
@@ -357,10 +358,10 @@ Evidence: ev-content-encodings, ev-framing-constants, ev-validator-jfr-annex, Pa
 ### 5.2 Metadata event
 
 ```
-preamble    = [size] [typeId=0] [startTime] [duration] [metadataId]
-native      = [size] [typeId=0] [time words] [envelope]   // native major >= 0
-payload     = [poolSize:varint] [string x poolSize (tags 0-5)] [root element]
-element     = [name:poolref] [attrCount:{name,value} x] [childCount:{element} x]
+preamble = [size] [typeId=0] [startTime] [duration] [metadataId]
+native = [size] [typeId=0] [time words] [envelope] // native major >= 0
+payload = [poolSize:varint] [string x poolSize (tags 0-5)] [root element]
+element = [name:poolref] [attrCount:{name,value} x] [childCount:{element} x]
 ```
 
 - The annex preamble is byte-frozen. The metadataId varint supports cross-chunk parse shortcuts only; identical payload means identical descriptor.
@@ -393,7 +394,7 @@ Annex chunks use ids as JFR v2 emits them (small first-come ids). The reserved b
 |---:|---|---|
 | 0 | `framing` | sync-point kinds (§4.4), provenance + attachment-fragment types (§6.2, §6.3), header-adjacent state |
 | 1 | `jfr-core` | JVM vocabulary (JDK event semantics as declared types) |
-| 2 | `exec-trace` | execution-tracing vocabulary: task/executor (scheduling states, Go P/G model), slices (duration events; nesting = track+time convention), instants, counters (+ unit/temporality descriptors), STATE tracks, timestamped stack samples, per-sequence numbers [find-exec-trace-vocabulary] |
+| 2 | `exec-trace` | execution-tracing vocabulary: task/executor (scheduling states, Go P/G model), slices (duration events; nesting = track+time convention), instants, counters (+ unit/temporality descriptors), STATE tracks, timestamped stack samples, per-sequence numbers |
 | 3+ | ledger | append-only additions (spec-adjacent registry file, community-tracked) |
 
 Evidence: find-migration-strategy, find-type-id-model, ev-parser-dynamics, ChunkHeader.java:224-239, ev-metadata-event, ev-validator-jfr-annex, MetadataReader.java, hyp-metadata-encoding, ev-framing-constants.

@@ -1,62 +1,152 @@
 # VIREL — Versioned In-band Runtime Event Ledger
 ### Specification draft v0.1 · VIRL native major 0 · VIRC container major 0 · JFR payload majors 1/2 (frozen) · 2026-10-05
 
-> **Status:** DRAFT. VIREL is the selected protocol name. Native chunks use
-> magic `VIRL` and wire type namespaces `virel.*`, `virel2.*`, and
-> `virel3.*`. `FLR\0` remains exclusively JFR.
-> Derived from the jfr-spec investigation graph (`.investigations/jfr-spec/`,
-> 28 nodes); every normative claim about JFR v1/v2 carries a node id with
-> file:line evidence. Numeric assignments marked PROPOSED were invented by
-> this draft and are now RATIFIED by proceed (2026-10-03); all other content
-> is decided. Corrections from the validator run are folded in as of
-> 2026-10-03 (see ev-validator-jfr-annex).
-> **2026-10-04/05:** VIREL has two file kinds (§3.1). A **VIRL** file is one
-> native event stream: self-sufficient, concatenable, and streamable on
-> non-seekable sinks (§3.9.6). A **VIRC** file is a format-agnostic container
-> of framed streams, where native VIREL and JFR are payload formats on equal
-> footing with Go trace, Perfetto and OTLP [find-agnostic-container,
-> find-container-split]. Container and streaming numerics are PROPOSED.
+> **Status:** DRAFT. Native chunks use magic `VIRL` and wire type
+> namespaces `virel.*`, `virel2.*`, and `virel3.*`. `FLR\0` remains
+> exclusively JFR. Native major 0 is the active design version and is
+> revised in place until ratification: numeric assignments marked PROPOSED
+> are not yet stable, all other content is decided. Design rationale and
+> the decisions behind each rule are distilled in
+> `.knowledgebase/memories/`.
+> VIREL has two file kinds (§3.1). A **VIRL** file is one native event
+> stream: self-sufficient, concatenable, and streamable on non-seekable
+> sinks (§3.9.6). A **VIRC** file is a format-agnostic container of framed
+> streams, where native VIREL, JFR, Go trace, Perfetto and OTLP are payload
+> formats on equal footing. Container and streaming numerics are PROPOSED.
+
+---
+
+## 0. Overview and reading map
+
+VIREL solves one problem: runtimes and collectors record event traces in
+incompatible binary formats, so every toolchain writes its own readers, and
+combining traces from different runtimes means converting them lossily or
+not at all. VIREL defines one container plus one native stream format that
+carries the popular formats side by side without converting them, and gives
+new producers a low-overhead native format with the write-path economics of
+JFR and Go traces (§1 lists the goals and non-goals).
+
+Two concepts cover the whole format:
+
+- A **chunk** is a self-contained partition of an event stream: a header,
+  events, then the pool data those events refer to. Every chunk carries its
+  full metadata, so a reader attaches at any chunk boundary without reading
+  anything before it.
+- A **record** is one framed unit of the VIRC container: a header with
+  in-band sizes, stream id, sequence number and CRCs, followed by payload
+  bytes. Concatenating a stream's DATA-record payloads reproduces that
+  stream's bytes exactly.
+
+The three file shapes a reader meets:
+
+```
+VIRL file (one native stream)         VIRC file (container)
+┌───────┬───────┬───────┬─────┐      ┌──────────┬───────┬───────┬───────┬────┐
+│ chunk │ chunk │ chunk │ ... │      │ 32-byte  │ STREAM│ DATA  │ DATA  │... │
+└───────┴───────┴───────┴─────┘      │ header   │ descr │ chunk │ chunk │    │
+ chunks concatenate; each is          └──────────┴───────┴───────┴───────┴────┘
+ self-contained                        one record frames one payload stream:
+                                       virel, jfr, go-trace, perfetto, otlp-*
+```
+
+### 0.1 A real chunk, byte by byte
+
+A single-chunk VIRL file written by the prototype writer
+(`benchmarks/generation_writer.cpp`, 300 events, one producer). The first
+76 bytes are the native header — every field is big-endian:
+
+```
+00000000  56 49 52 4c 00 00 00 01  00 00 00 00 00 00 24 1d   VIRL.....$.
+00000010  00 00 00 00 00 00 24 00  00 00 00 00 00 00 00 4c  ..........L
+00000020  18 e9 b8 e0 2d ad 08 92  00 00 00 00 00 53 2d 9f  ....-....S-.
+00000030  00 02 c7 f5 34 52 7c 95  00 00 00 00 3b 9a ca 00  ....4R|...;.
+00000040  00 00 80 01 56 49 52 45  4c 42 45 4e              ....VIRELBEN
+```
+
+| off | bytes | field | value here |
+|----:|---|---|---|
+| 0..3 | `56 49 52 4c` | magic | `VIRL` — a native chunk (§3.9.2) |
+| 4..5 | `00 00` | major | 0 = the draft native line |
+| 6..7 | `00 01` | minor | 1 |
+| 8..15 | `...24 1d` | chunk size | 9245 — back-patched at finalize; a reader skips the chunk in one jump |
+| 16..23 | `...24 00` | last state-snapshot offset | 9216, chunk-relative |
+| 24..31 | `...00 4c` | metadata position | 76 = the first event |
+| 32..39 | `18 e9 ...` | chunk start | UNIX epoch ns |
+| 40..47 | `00...00` | duration | back-patched at finalize |
+| 48..55 | `00 53 2d 9f ...` | chunk start ticks | tick axis |
+| 56..63 | `00 02 c7 f5 ...` | ticks per second | 1e9 here |
+| 64 | `00` | state | 0x00 = COMPLETE (0xff = live, §3.9.3) |
+| 65 | `00` | pad | |
+| 66..67 | `80 01` | flags | @66 high byte: bit 7 SET = VIREL-native signature; low bits 0 = metadata default encoding id. @67 low byte: stream/final flags |
+| 68..75 | `56 49 52 45 4c 42 45 4e` | writer id | random u64; distinguishes writers when files concatenate |
+
+The first event starts at offset 76 (where the header says the metadata
+sits). Every event is `[size:varint][typeId:varint][time words][fields]`,
+and `size` counts its own varint width:
+
+```
+9b 02     size = 0x1b | (0x02 << 7) = 283 bytes — skip the whole event by size
+00        typeId = 0 → a metadata event (§5.2): this chunk's schema
+...       the metadata payload (types, fields, pools declarations)
+```
+
+This is the reader's contract in miniature: attach at a chunk boundary,
+read 76 header bytes, then walk size-prefixed events — skipping any event
+it does not understand, and skipping any pool it does not need, by size
+alone (§4.4).
+
+### 0.2 Reading map
+
+| Go to | When you want |
+|---|---|
+| §1 Design goals | what is in scope, what is a non-goal |
+| §2 Conventions | varint, endianness, the normative terms |
+| §3.1-§3.8 | the VIRC container: records, stream descriptors, manifest, recovery |
+| §3.9 | VIRL and the chunk grammar: headers, live writing, truncation, streaming chunks |
+| §4 | the content layer: event layout, encodings, time, state snapshots and pools |
+| §5 | metadata and the type system: how a reader learns the schema |
+| §6 | profiles: which payload formats convert, and at what fidelity |
+| §7-§9 | evolution rules, declared extensions, honest limits |
+| §11 | the machine-readable artifacts shipped with this spec |
+
+The RFC (`doc/tcf-rfc.md`) carries the same protocol for review circulation;
+read the spec for full detail.
 
 ---
 
 ## 1. Design goals
 
-0. **Event-oriented scope** (2026-10-04) [find-event-scope]: VIREL records
+0. **Event-oriented scope**: VIREL records
    and carries *event* streams, i.e. timestamped records such as JFR events,
    Go trace events, Perfetto packets, trace-event JSON, timestamped CPU
    samples, and OTLP spans and logs. Formats without timestamped events are
    out of scope: aggregated profiles (pprof, OTLP Profiles), heap snapshots
    (HPROF, V8 heap profiles), folded stacks.
 1. **Superset**: one format represents JFR (`.jfr`), Go execution trace v2,
-   and Perfetto (TracePacket) as **sub-configurations** [find-superset-goal,
-   find-coverage-matrix].
+   and Perfetto (TracePacket) as **sub-configurations**.
 2. **Two file kinds**: a VIRL file is one self-sufficient, concatenable,
    streamable native event stream (§3.9); the VIRC container (§3) frames
    streams of any format (native VIREL, JFR, Go trace, Perfetto, OTLP traces
-   and logs) identically and never interprets payloads
-   [find-agnostic-container, find-container-split]. A conforming reader MUST
-   read VIRL files and `virel` streams. Decoding any other format is OPTIONAL and supported
+   and logs) identically and never interprets payloads. A conforming reader
+   MUST read VIRL files and `virel` streams. Decoding any other format is OPTIONAL and supported
    through payload decoders (plugins) (§3.1). JFR-annex chunks share the
    native chunk grammar (§3.9), so a `jfr` decoder is cheap to provide, but it
-   is not mandatory [find-subset-direction, superseded in part].
+   is not mandatory.
 3. **Migration-first**: extreme ease of conversion from all popular trace
    formats — expressible, streaming single-pass bounded-memory, no
    infrastructure prerequisites (no protoc, no registry, no codec deps),
-   bootstrap emitter (CTEF JSON) [find-migration-
-   strategy]. Zero-conversion first step: an existing producer's output
+   bootstrap emitter (CTEF JSON). Zero-conversion first step: an existing producer's output
    becomes VIREL data by being framed as a stream (§3), with no encoder
    change.
 4. **Low overhead writes**: same cost model as JFR/Go batching — in-band
-   varint sizes, padded back-patches, chunk-local interning [ev-content-
-   encodings, ev-prior-art-fine-tracers].
+   varint sizes, padded back-patches, chunk-local interning.
 5. **Convergent mechanics, not novelty**: chunked self-contained partitions,
    per-partition interning, back-patched batch lengths, in-band sync/loss
-   markers = the baseline JFR, Go tracev2, and Perfetto share [ev-prior-art-
-   fine-tracers].
+   markers = the baseline JFR, Go tracev2, and Perfetto share.
 
 Non-goals for v1.0: formats without timestamped events (goal 0); replacing
 OTLP as a telemetry protocol (OTLP traces and logs are carried byte-exactly as
-streams, never converted into a competing VIREL vocabulary) [find-event-scope];
+streams, never converted into a competing VIREL vocabulary);
 payload compression inside the container (whole-stream
 `content-encoding` aside), cross-stream references, multi-clock domains, machine
 federation, per-writer sub-chunk regions (all have declared extension
@@ -68,15 +158,14 @@ anchors, §8).
 
 - Words are bit-strings; **big-endian** byte order for all fixed-width and
   floating-point words in every major (JFR v2 is BE; Go/Perfetto variance is
-  a converter concern, not a format one) [ev-chunk-header].
+  a converter concern, not a format one).
 - `varint` = LEB128: groups of 7 low bits, little-endian order, high bit =
   continuation; **at most 9 bytes** (9th byte carries raw 8 bits). Identical
-  family to protobuf varints and Go trace varints [ev-content-encodings,
-  ev-prior-art-fine-tracers].
+  family to protobuf varints and Go trace varints.
 - `padded varint` = varint written at fixed width with zero-bit padding;
   readers MUST accept any legal width; used where a field's length must be
   back-patched after it is known (chunk size, event size, batch length).
-  Proven in all three reference formats [ev-chunk-header, ev-prior-art].
+  Proven in all three reference formats.
 - Integers are unsigned unless a declared type says signed (two's-
   complement, sign in the varint's raw bits).
 - Pool reference = `u32` key into the type's constant pool; **0 = null**.
@@ -97,8 +186,7 @@ anchors, §8).
 
 ## 3. File kinds: VIRL native streams and the VIRC container
 
-> Decided 2026-10-04 [find-agnostic-container]; split into two file kinds
-> with a streaming mode 2026-10-05 [find-container-split]. Numerics in this
+> VIREL has two file kinds (§3.1). Numerics in this
 > section (container signature, record layout, kinds, descriptor keys, format
 > ids, the STREAMING flag) are PROPOSED and not yet ratified. The former
 > §3.1–§3.5 (chunk headers, chunk live-write, chunk recovery, foreign-chunk
@@ -232,7 +320,7 @@ A STREAM record's payload is a key/value list (varints per §2):
 
 ```
 descriptor = count:varint
-             { keyLen:varint key:UTF-8  valueLen:varint value:bytes } x count
+             { keyLen:varint key:UTF-8 valueLen:varint value:bytes } x count
 ```
 
 - Keys are case-sensitive. Unknown keys are ignored. Keys starting with `x-`
@@ -280,8 +368,8 @@ mandatory (§3.1).
 #### 3.4.2 Clock anchors
 
 ```
-anchor = clockLen:varint clock:UTF-8  ticks:varint  frequency:varint
-         unixNanos:varint  uncertaintyNanos:varint
+anchor = clockLen:varint clock:UTF-8 ticks:varint frequency:varint
+         unixNanos:varint uncertaintyNanos:varint
 ```
 
 At the moment the payload clock `clock` read `ticks` (in units of
@@ -302,7 +390,7 @@ give its drift.
   `v8-timeticks` (V8 `TimeTicks`), `uv-hrtime` (libuv `uv_hrtime`). Two clocks
   that coincide on one platform keep separate names: on macOS,
   `v8-timeticks` (`mach_absolute_time`) stops during sleep while `uv-hrtime`
-  (`mach_continuous_time`) does not [ev-node-split-clock].
+  (`mach_continuous_time`) does not.
 - A collector that records its own anchor SHOULD read the payload's clock and
   the wall clock back to back on the producing host, and set
   `uncertaintyNanos` to the measured bracket.
@@ -352,14 +440,14 @@ Format-specific rules that affect containers:
 ```
 manifest = version:varint (= 1)
            streamCount:varint
-           { streamId:varint  firstStreamRecord:varint (file offset)
-             dataRecords:varint  payloadBytes:varint
-             timeStart:varint  timeEnd:varint (0 = unknown)
+           { streamId:varint firstStreamRecord:varint (file offset)
+             dataRecords:varint payloadBytes:varint
+             timeStart:varint timeEnd:varint (0 = unknown)
              flags:varint (bit 0 = ENDED) } x streamCount
            indexCount:varint (0, or the number of DATA records)
-           { recordOffset:varint  streamId:varint  sequence:varint
-             timeStart:varint  timeEnd:varint
-             flags:varint (the record's flags byte) } x indexCount   // ascending offset
+           { recordOffset:varint streamId:varint sequence:varint
+             timeStart:varint timeEnd:varint
+             flags:varint (the record's flags byte) } x indexCount // ascending offset
 ```
 
 The manifest only accelerates reading. It MUST agree with the records. A
@@ -457,7 +545,7 @@ exclusively a JFR magic.
 
 #### 3.9.1 Legacy annex header — majors 1.x/2.x (BYTE-FROZEN, 68 bytes)
 
-All big-endian [ev-chunk-header, ev-framing-constants]:
+All big-endian:
 
 | off | len | field | notes |
 |----:|----:|---|---|
@@ -481,13 +569,13 @@ start-ticks/frequency are stable.
 
 #### 3.9.2 Native header — majors 0 (draft) and 1 (stable) — 76 bytes
 
-**Version-number policy (normative)** [find-version-resilience]: native
+**Version-number policy (normative)**: native
 chunks use the distinct `VIRL` magic; `FLR\0` remains exclusively JFR's.
 The signature bit is a required class guard inside the shared header layout:
 
 - `@66 bit 7 (0x80) = VIREL-NATIVE signature` — SET in every `VIRL` native
   chunk, ALWAYS clear in JFR-legacy chunks (v2 provably writes @66 = 0 and
-  its readers never read byte 66 [ev-chunk-header]).
+  its readers never read byte 66).
 - `@66 bits 0..6` = metadata-default-encoding id (0..127).
 - **Native majors**: 0 = this draft; **1 = first stable native** once the
   spec is ratified (graduation — majors do NOT stay at 0 forever); any
@@ -505,7 +593,7 @@ The signature bit is a required class guard inside the shared header layout:
 
 Native chunks use `VIRL` at offsets 0..3; offsets 4..67 retain the Annex
 §3.9.1 layout and positions unchanged; the size is major-scoped
-[ev-chunk-header]:
+:
 
 | off | len | field | notes |
 |----:|----:|---|---|
@@ -514,7 +602,7 @@ Native chunks use `VIRL` at offsets 0..3; offsets 4..67 retain the Annex
 | 64 | 1 | file state | 0 = COMPLETE; 0xff = UPDATING |
 | 65 | 1 | pad | |
 | 66 | 2 | flags (BE u2) | low byte @67: bit 1 = FINAL-CHUNK; bit 2 = STREAMING (streaming vs finalized header state, §3.9.6, PROPOSED) (bit 0 reserved; the varint regime is MANDATORY in major 0) | high byte @66 (**NEW**): metadata-default-encoding id, §5.2 — advisory; envelope tag is authoritative |
-| 68 | 8 | **writer id (NEW)** | `u64` BE, random per writer (Perfetto-TrackDescriptor-uuid style); discoverable at chunk attach; required by the one-writer-per-chunk rule [find-superset-goal] |
+| 68 | 8 | **writer id (NEW)** | `u64` BE, random per writer (Perfetto-TrackDescriptor-uuid style); discoverable at chunk attach; required by the one-writer-per-chunk rule |
 
 **Ratified**: writer-id = 64-bit random (zero = null/writer-unspecified,
 e.g. single-writer converters that do not wish to mint ids).
@@ -529,7 +617,7 @@ The state byte at 64 transitions 0xff → 0x00 at finalize. A live reader
 SHALL read state, then the posthoc fields, then state again; accept only on
 equal reads. This reproduces the JDK protocol (ChunkHeader.java: FILE_
 STATE_POSITION=64, UPDATING_CHUNK_HEADER=255) and gives single-chunk
-streaming [ev-live-header-protocol]. The FINAL-CHUNK flag bit is the only
+streaming. The FINAL-CHUNK flag bit is the only
 crash-vs-clean marker within the stream; normative truncation recovery
 (§3.9.4) covers the rest. In a container, record state (§3.6) and the END
 record (§3.7) add container-level crash detection; the chunk seqlock still
@@ -574,7 +662,7 @@ readers skip what they do not know and never clash with a version space
 they cannot coordinate with. Supporting a future JFR annex (e.g. real JFR
 major 3) is later a pure spec revision, additive in both directions.
 
-#### 3.9.6 Streaming chunks and finalization (native only; PROPOSED 2026-10-05)
+#### 3.9.6 Streaming chunks and finalization (native only; PROPOSED)
 
 A native chunk header is in one of two states, and readers tell them apart
 from the header alone:
@@ -590,7 +678,7 @@ reader can then be looking at a chunk mid-finalization.
 Streaming chunks serve live transport on sinks that cannot seek (pipes,
 sockets, append-only uploads). Finalized chunks serve storage and
 distribution. Producers SHOULD distribute finalized VIRL; streaming VIRL is
-for when streaming is requested [find-container-split].
+for when streaming is requested.
 
 **Writing streaming chunks.** A writer that cannot seek writes them:
 
@@ -647,19 +735,18 @@ a seekable medium or on a copy.
 ## 4. Content layer
 
 Identical wire grammar for annex and native major 0, except the tick-word
-semantics (§4.2). Grammar [ev-content-encodings, ev-framing-constants]:
+semantics (§4.2). Grammar:
 
 ```
-event      = size:pvarint        // includes its own varint width
-             typeId:varint       // §5.3
-             time words          // §4.2
-             fields              // per declared type
+event = size:pvarint // includes its own varint width
+             typeId:varint // §5.3
+             time words // §4.2
+             fields // per declared type
 ```
 
 ### 4.1 Field encodings
 
-- Primitive encodings (annex-verified, [ev-validator-jfr-annex;
-  ParserFactory.java:186-276, RecordingInput.java]): `int`/`long`/`short`/
+- Primitive encodings (annex-verified,): `int`/`long`/`short`/
   `char` = varint (cast to declared width; readChar = varint code unit);
   `boolean`/`byte` = 1 raw byte; `float`/`double` = BE IEEE.
   No per-field codec negotiation exists — one varint regime for all
@@ -670,7 +757,7 @@ event      = size:pvarint        // includes its own varint width
   RAW 8 bits (RecordingInput.readLong semantics). A plain 10-byte LEB
   (e.g. for the 64-bit sentinel 2**64−1, Go's NoThread) is a VIOLATION:
   readers stop at the terminator bit and the residual byte drifts every
-  later field [ev-go-gate-3]. Writers of 64-bit values MUST use the
+  later field. Writers of 64-bit values MUST use the
   9-byte form.
 - Strings — 1-byte kind tag then payload; kinds:
   | tag | kind | payload |
@@ -693,8 +780,7 @@ event      = size:pvarint        // includes its own varint width
     or declared composite, e.g. a typed pool entry ref) = **bare varint
     key with NO tag byte**; key 0 = null. A tag byte before a non-string
     pool key is a 1-byte-per-occurrence drift that corrupts all later
-    reads (position-sequential pool entries) [ev-pprof-gate-4,
-    ev-go-gate-3].
+    reads (position-sequential pool entries).
 - **BYTES kind** (major 0 only): first-class binary field; carries
   attachment fragments (§6.4) and raw records. Skipping = consume length.
 
@@ -705,11 +791,11 @@ event      = size:pvarint        // includes its own varint width
   process's elapsed-counter axis (JVM: `os::elapsed_counter()`/rdtsc,
   `FastUnorderedElapsedCounterSource` — deliberately NON-monotonic,
   "can jump backwards"). Conversion: `nanos = startNanos + (ticks −
-  startTicks)/frequency` [ev-framing-constants, TimeConverter.java:36-40].
+  startTicks)/frequency`.
 - **Major 0 (native) semantics**: ticks are CHUNK-RELATIVE (0 = chunk startTicks
   anchor); writers of a chunk MUST be non-decreasing within the chunk.
   Rationale: cheap varint deltas, writer-monotonicity restored, and Go/
-  Perfetto converters avoid epoch rewrites [find-exec-trace-vocabulary].
+  Perfetto converters avoid epoch rewrites.
 - Durationless events omit the duration word (schema-driven).
 - Nanosecond axis: chunk startNanos (UNIX epoch ns) + frequency is the only
   wall anchor in v1.0. Multi-clock = §8 extension.
@@ -718,20 +804,17 @@ event      = size:pvarint        // includes its own varint width
 
 In major 0, event order per writer = chunk order = append order; cross-
 writer order is NOT chronological by default (matches Go's trace, JFR's
-FastUnordered ticks). Every event carries real time words. The former
-"timebase-neutral records with filler time words" rule, which existed only
-for aggregated pprof samples, was withdrawn on 2026-10-04 with the
-event-oriented scope (§1 goal 0) [find-event-scope].
+FastUnordered ticks). Every event carries real time words.
 
 ### 4.4 State snapshots, pools, sync points
 
-Bootstrap type ids — **fixed in ALL majors** [ev-framing-constants]:
+Bootstrap type ids — **fixed in ALL majors**:
 - `0` = metadata event (§5.2) — must exist before any metadata is resolvable
-- `1` = state-snapshot event — pools and writer state.  In the byte-frozen
+- `1` = state-snapshot event — pools and writer state. In the byte-frozen
   JFR annex this record is named a *checkpoint*; VIREL deliberately uses the
   more accurate native term *state snapshot*.
 
-The annex checkpoint grammar is byte-frozen ([ev-validator-jfr-annex]):
+The annex checkpoint grammar is byte-frozen:
 `[size][1][timestamp][duration][delta][flush:u1][poolCount][entries...]`
 where an entry = `[typeId][count][{key:varint, value: FULL payload} x count]`.
 Native VIREL calls the record a **state snapshot**. Its existing
@@ -749,10 +832,10 @@ state-snapshot = [size] [1] [timestamp] [duration] [delta] [snapshotFlags:u1]
 `summaryVersion = 1` in this draft. The entries are
 strictly ascending by `typeId`; each count is the exact cumulative number of
 non-bootstrap records of that type preceding this snapshot in this chunk.
-Type ids 0 (metadata) and 1 (the state snapshot itself) are excluded.  A
+Type ids 0 (metadata) and 1 (the state snapshot itself) are excluded. A
 snapshot in a COMPLETE chunk immediately before `END_OF_PARTITION` is thus a
 definitive type-presence/count index for the chunk; a live snapshot covers
-only the prefix before its own offset.  A reader maps a symbolic type name to
+only the prefix before its own offset. A reader maps a symbolic type name to
 an id using metadata, then binary-searches this small table without parsing
 event bodies or pools.
 
@@ -760,7 +843,7 @@ The header's offset-16 field retains its JFR name **last checkpoint offset**
 in annex chunks and means **last state snapshot offset** in native chunks.
 It points at the record above; `delta` walks state snapshots backward.
 Already-parsed pool entries carry full payload (skip = consume-and-discard;
-dedup is object-level, not wire-level) [ev-parser-dynamics].
+dedup is object-level, not wire-level).
 
 **Per-pool state snapshots (native draft, ratified find-pool-skip (b)+(c))**:
 a chunk MAY carry any number of state snapshots; a state snapshot MAY
@@ -770,13 +853,13 @@ carry ANY subset of the chunk's pools.
   parsing any entry bytes, exactly like an event (query readers bound
   parse cost to the pools they use; spiked on real pprof fixtures:
   +1.4..3.7% state-snapshot bytes, 27-29% less parsed for a strings-only
-  query [find-pool-skip]). Writers of small pools MAY co-locate.
+  query). Writers of small pools MAY co-locate.
 - **Reader contract**: pool materialization is LAZY by type id; entries
   always carry FULL payload, so skipping costs no later re-parse;
   pools resolve by type id from any state snapshot in the chunk, walking
   delta chains backward. Annex-compatible by construction: JFR v2
   already writes multiple delta-chained checkpoint events per chunk
-  (in-band header checkpoints) [ev-header-checkpoints].
+  (in-band header checkpoints).
 - Per-pool state snapshots double as sync points: partial-write recovery
   granularity improves (a mid-pool flush crash loses only up to the
   last pool event).
@@ -795,8 +878,7 @@ numerics (all under m0; ids are the declared types' local ids, not magic):
 
 Cadence: writers SHOULD write a state snapshot within a durability window (e.g. ≤ 1 s
 of event time or ≤ a few MB); normative readers rely on sync points only up
-to the last successfully parsed one [ev-header-checkpoints,
-ev-parser-unknown-handling].
+to the last successfully parsed one.
 
 ---
 
@@ -805,13 +887,12 @@ ev-parser-unknown-handling].
 ### 5.1 Model
 
 - Declared types live **in-stream** (self-describing; no out-of-band schema,
-  no registry dependency — the migration property #3 [find-migration-
-  strategy]).
+  no registry dependency — the migration property #3).
 - **Type-id bindings are ADD-ONLY**. Registered ids ([2, 2³⁰), §5.3) are
   global. Dynamic ids ([2³⁰, 2⁶²)) are scoped to the chunk's writer id within
   a stream, so concatenated VIRL files of different writers never conflict
   (§3.9). Within that scope a binding is never re-bound;
-  redefinition = stream violation [find-type-id-model].
+  redefinition = stream violation.
 - **Metadata and state snapshots are separate with a one-way dependency.**
   Metadata declares `typeId` and field layouts and needs no pool state. A
   state snapshot materializes pool entries for those declared types, so a
@@ -839,29 +920,28 @@ type is literally `<class ...>`) and `region` (locale/gmtOffset/dst); a
 field's referenced type id rides in the `class` attribute; event types
 declare `startTime`, optionally `duration`, then `eventThread`/`stackTrace`
 (constant-pool attrs) and user fields as ordinary field elements — the
-event grammar needs no hidden words [ev-metadata-event,
-ev-validator-jfr-annex, MetadataReader.java].
+event grammar needs no hidden words.
 
 **Native (major >= 0, envelope)**: `[size][typeId=0][time words][envelope]`.
 
 - **Envelope tag (authoritative)**: `varint encoding-id` + payload. Native
   chunks MAY omit the envelope when the header flags' high byte (@66)
   names the default encoding — then encoding = header default.
-  **Permit-but-discourage**: changing encoding within one chunk
-  [hyp-metadata-encoding].
-- Encoding registry — ratified by proceed (2026-10-03): 0 = `xml-v2`
+  **Permit-but-discourage**: changing encoding within one chunk is free
+  (the envelope tag travels with the event), but writers SHOULD keep a
+  chunk single-encoding.
+- Encoding registry: 0 = `xml-v2`
   (legacy, the ONLY encoding for annex chunks — binarized XML with string
-  pool, gmtOffset/DST/locale, exact grammar above [ev-metadata-event]);
+  pool, gmtOffset/DST/locale, exact grammar above);
   1 = flat-binary; 2 = protobuf; 3 = CBOR; 4 = JSON. All express the SAME
   logical model (types, fields, attributes, units; consumers choose by
   capability).
-- 5 = `avro` — ratified (2026-10-03): Avro's writer-schema-in-stream +
-  resolution rules are the only mainstream native match for VIREL's add-only
-  evolution [find-idl-codegen]. CORRECTED same day: the deeper ratified
-  intent = VIREL is expressible IN-FULL as Avro (one complete protocol model,
-  find-avro-full-model) — the metadata encoding id is the small part.
+- 5 = `avro`: Avro's writer-schema-in-stream + resolution rules are the
+  only mainstream native match for VIREL's add-only evolution. The deeper
+  intent: VIREL is expressible IN-FULL as Avro (one complete protocol
+  model, §11) — the metadata encoding id is the small part.
 
-### 5.3 Type-id space — splits (ratified by proceed)
+### 5.3 Type-id space — splits
 
 | range | use |
 |---|---|
@@ -873,26 +953,26 @@ ev-validator-jfr-annex, MetadataReader.java].
 
 Annex chunks (v2): ids are as JFR v2 emits them — small first-come ids
 assigned by the metadata itself; the reserved 0/1 bootstrap ids above hold
-[ev-framing-constants].
+for the annex too.
 
 ### 5.4 Pools and pool kinds
 
 - Pools = checkpoint-recorded key→value tables for pooled typeIds.
 - Validity = chunk (writer-scoped). A chunk's first checkpoint (or its
   complete snapshot) bootstraps validity; writers MUST NOT assume validity
-  beyond the chunk [find-type-id-model].
+  beyond the chunk.
 - Keys: u32; 0 = null (mirrors string POOL-REF and OTLP dictionary index-0
-  nullability [find-otlp-profile-mapping]).
+  nullability).
 - No per-writer pool namespaces (ruled out); writer identity is the chunk
   header writer-id; partitioning happens at chunk granularity.
 
-### 5.5 Module ledger — assignments (ratified by proceed)
+### 5.5 Module ledger — assignments
 
 | module id | name | content |
 |---:|---|---|
 | 0 | `framing` | sync-point kinds (§4.4), provenance + attachment-fragment types (§6.2, §6.3), header-adjacent state |
 | 1 | `jfr-core` | JVM vocabulary (JDK event semantics as declared types) |
-| 2 | `exec-trace` | execution-tracing vocabulary: task/executor (scheduling states, Go P/G model), slices (duration events; nesting = track+time convention), instants, counters (+ unit/temporality descriptors), STATE tracks, timestamped stack samples, per-sequence numbers [find-exec-trace-vocabulary] |
+| 2 | `exec-trace` | execution-tracing vocabulary: task/executor (scheduling states, Go P/G model), slices (duration events; nesting = track+time convention), instants, counters (+ unit/temporality descriptors), STATE tracks, timestamped stack samples, per-sequence numbers |
 | 3+ | ledger | append-only additions (spec-adjacent registry file, community-tracked) |
 
 ---
@@ -916,7 +996,7 @@ stream is readable by every conforming reader.
 | `go-trace` | `go-trace` | 0 | lossless representation (converter) | round-trip: Go gen → VIREL chunk → reconstruct Go trace |
 | `perfetto` | `perfetto` | 0 | lossless representation | round-trip TracePacket stream |
 
-### 6.2 Conversion provenance (standardized) [find-conversion-provenance]
+### 6.2 Conversion provenance (standardized)
 
 Declared metadata type `provenance` (module m0), emitted per chunk. When the
 source is embedded in the same container, the converted stream's descriptor
@@ -955,12 +1035,12 @@ SHOULD also name it with `derived-from` (§3.4):
 ### 6.4 Reference converters = validators
 
 The round-trip suites and the shipped reference converters are the SAME
-artifacts [find-converter-cost]: Go converter buffers one generation
+artifacts: Go converter buffers one generation
 (source format's own granularity, ~16 MiB ceiling); Perfetto converter
 streams 1:1 via mid-chunk checkpoints. Tier B (CTEF/cpuprofile, perf.data, ftrace, CTF, ETW):
 shape-fold converters + CTEF emitter first (adoption wedge).
 
-### 6.5 Fidelity classes and conformance ladder [find-migration-strategy]
+### 6.5 Fidelity classes and conformance ladder
 
 Migration ease from currently-popular formats is THE product criterion;
 the conformance ladder makes it testable:
@@ -971,8 +1051,7 @@ the conformance ladder makes it testable:
   ticks/args/pools — ev-go-gate-3), Perfetto protobuf (pairs + folding
   = read-side — ev-validator-pfetto). The former pprof/OTLP-profiles suite
   (gate 4) is no longer a profile suite; it stays as a wire regression test
-  for pooled references, Varint128 and pool skipping [ev-pprof-gate-4,
-  find-event-scope].
+  for pooled references, Varint128 and pool skipping.
 - **Tier B — documented shape transform (vocabulary-level)**: all of
   the source's event-level semantics expressible and reconstructable
   modulo LISTED transforms; not byte identity. Verified for CTEF
@@ -989,15 +1068,15 @@ the conformance ladder makes it testable:
 
 ## 7. Evolution rules
 
-- File kinds [find-container-split]: VIRL (`VIRL` chunk magic) and VIRC
+- File kinds: VIRL (`VIRL` chunk magic) and VIRC
   (`VIRC\r\n\x1a\n` signature) evolve independently: VIRL by native
   majors/minors, VIRC by container majors/minors.
-- Container [find-agnostic-container]: container major 0 = this draft;
+- Container: container major 0 = this draft;
   readers reject unknown container majors; minors are additive. The record
   kind registry, descriptor keys and format ids are append-only. A stream
   with an unknown format id is carried and extracted byte-exactly, never
   decoded.
-- Majors [find-version-resilience]: native VIREL majors = signature-set
+- Majors: native VIREL majors = signature-set
   chunks: **0 = draft (this spec); 1 = first stable (graduation upon
   ratification)**; later native majors = advertised spec events, additive
   preferred. JFR annex = majors 1/2, signature clear — frozen forever.
@@ -1060,7 +1139,7 @@ profiler OutputFormats/ProfilerOptions/JfrVisualization docs.
 
 ---
 
-## 11. Machine-readable artifacts shipped with the spec [find-idl-codegen]
+## 11. Machine-readable artifacts shipped with the spec
 
 - `tcf-framing.ksy` — Kaitai Struct description of the VIRC container records
   and of VIRL / `virel`/`jfr` chunk streams, including streaming chunks walked
@@ -1081,10 +1160,10 @@ profiler OutputFormats/ProfilerOptions/JfrVisualization docs.
   metadata) remains the REQUIRED conformance baseline — machine-readable
   artifacts are conveniences, never substitutes.
 
-*Draft ends. All numerics ratified by proceed (2026-10-03): sync-point
-kind table (§4.4), encoding-registry ids (§5.2), type-id splits (§5.3),
-module ledger (§5.5), writer-id=0 semantics (§3.9.2), VIREL-signature bit
-@66 bit 7 + encoding-id cap 0..127 (§3.9.2), encoding id 5 = avro
-(ratified 2026-10-03). Container numerics (§3: signature, record
-layout, record kinds, descriptor keys, format ids, manifest) are PROPOSED
-(2026-10-04), not ratified.*
+*Draft ends. Ratified numerics: sync-point kind table (§4.4),
+encoding-registry ids (§5.2), type-id splits (§5.3), module ledger (§5.5),
+writer-id=0 semantics and the VIREL-signature bit @66 bit 7 + encoding-id
+cap 0..127 (§3.9.2), encoding id 5 = avro (§5.2). Container numerics (§3:
+signature, record layout, record kinds, descriptor keys, format ids,
+manifest) and streaming-chunk numerics (§3.9.6) are PROPOSED, not
+ratified.*
